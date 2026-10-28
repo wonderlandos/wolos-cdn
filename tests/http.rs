@@ -165,3 +165,40 @@ fn pulls_through_from_the_origin() {
     );
     assert!(!s.dir.join("bucket/wolos-2026-10-20/missing.db").exists());
 }
+
+/// Past MAX_BYTES the least recently used package goes; ranges resume downloads; `/` is the page.
+#[test]
+fn budget_range_and_page() {
+    let s = start_with("budget", 18434, &[("MAX_BYTES", "10")]);
+    let auth = ("Authorization", "Bearer secret");
+    for f in ["a.pkg.tar.zst", "b.pkg.tar.zst"] {
+        let url = format!("{}/r/{f}", s.base);
+        assert_eq!(
+            code(ureq::put(&url).set(auth.0, auth.1).send_string("123456")),
+            201
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        code(ureq::get(&format!("{}/r/a.pkg.tar.zst", s.base)).call()),
+        404
+    );
+    let r = ureq::get(&format!("{}/r/b.pkg.tar.zst", s.base))
+        .set("Range", "bytes=2-")
+        .call()
+        .unwrap();
+    assert_eq!(r.status(), 206);
+    assert_eq!(r.into_string().unwrap(), "3456");
+    let page = ureq::get(&format!("{}/", s.base))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(page.contains("WolOS CDN") && page.contains("r/b.pkg.tar.zst"));
+    let stats = ureq::get(&format!("{}/stats", s.base))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(stats.contains("\"max\":10"), "{stats}");
+}

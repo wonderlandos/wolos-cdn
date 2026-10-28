@@ -1,16 +1,20 @@
-//! Request handling: path rules, auth, cache headers, atomic writes, pull-through from ORIGIN.
+//! Request handling: path rules, auth, cache headers, atomic writes, pull-through from mirrors.
+use crate::cache::{Cache, immutable};
+use crate::page;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use futures_util::TryStreamExt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::StreamReader;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 
 pub struct Config {
     pub dir: PathBuf,
@@ -18,14 +22,51 @@ pub struct Config {
     pub token: String,
     /// Base URL a missing file is fetched from (GitHub release downloads); empty = none.
     pub origin: String,
+    /// Upstream mirrors by first path segment: `/archive/x` is fetched from `<url>/x`.
+    pub mirrors: Vec<(String, String)>,
+    /// Disk budget in bytes for the bucket.
+    pub max_bytes: u64,
 }
 
-type Ctx = Arc<(Config, reqwest::Client)>;
+struct Ctx {
+    cfg: Config,
+    client: reqwest::Client,
+    cache: Cache,
+}
 
 pub fn app(cfg: Config) -> Router {
+    let cache = Cache::open(&cfg.dir, cfg.max_bytes);
+    let client = reqwest::Client::builder()
+        .user_agent("wolos-cdn")
+        .build()
+        .expect("http client");
     Router::new()
         .fallback(handle)
-        .with_state(Arc::new((cfg, reqwest::Client::new())))
+        .with_state(Arc::new(Ctx { cfg, client, cache }))
+}
+
+/// `name=url,name=url` (MIRRORS env) as prefix pairs.
+pub fn mirrors(spec: &str) -> Vec<(String, String)> {
+    spec.split(',')
+        .filter_map(|m| m.split_once('='))
+        .map(|(p, u)| {
+            (
+                p.trim().to_string(),
+                u.trim().trim_end_matches('/').to_string(),
+            )
+        })
+        .filter(|(p, u)| !p.is_empty() && !u.is_empty())
+        .collect()
+}
+
+/// Where a missing file comes from: the mirror its first segment names, else the origin.
+pub fn upstream(rel: &str, mirrors: &[(String, String)], origin: &str) -> Option<String> {
+    if let Some((first, rest)) = rel.split_once('/')
+        && let Some((_, url)) = mirrors.iter().find(|(p, _)| p == first)
+    {
+        return Some(format!("{url}/{rest}"));
+    }
+    (!origin.is_empty()).then(|| format!("{}/{rel}", origin.trim_end_matches('/')))
 }
 
 /// A URL path as a relative path inside the bucket; directories, `..` and backslashes fail.
@@ -44,9 +85,8 @@ pub fn clean(url: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Package files and ISOs never change under one name; databases, manifests and signatures do.
 pub fn cache_control(rel: &str) -> &'static str {
-    if rel.contains(".pkg.tar.") || rel.ends_with(".iso") {
+    if immutable(rel) {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -69,17 +109,15 @@ fn text(code: StatusCode, msg: &str) -> Response {
     (code, msg.to_string()).into_response()
 }
 
-async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
-    let (cfg, client) = (&ctx.0, &ctx.1);
+async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     eprintln!("{} {path}", req.method());
+    let (cfg, cache) = (&ctx.cfg, &ctx.cache);
     match path.as_str() {
         "/healthz" => return text(StatusCode::OK, "ok\n"),
-        "/" => {
-            return text(
-                StatusCode::OK,
-                "WolOS package mirror. pacman: Server = <this host>/$repo-<release>\n",
-            );
+        "/" => return Html(page::html(cache, &cfg.mirrors, &cfg.origin)).into_response(),
+        "/stats" => {
+            return axum::Json(page::stats(cache, &cfg.mirrors, &cfg.origin)).into_response();
         }
         _ => {}
     }
@@ -88,70 +126,90 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     };
     let file = cfg.dir.join(&rel);
     match *req.method() {
-        Method::GET | Method::HEAD => get(&file, &rel, &cfg.origin, client).await,
+        Method::GET | Method::HEAD => get(&ctx, &file, &rel, req).await,
         Method::PUT | Method::DELETE if !authorized(req.headers(), &cfg.token) => {
             text(StatusCode::UNAUTHORIZED, "unauthorized\n")
         }
         Method::PUT => {
             let body = req.into_body().into_data_stream().map_err(io::Error::other);
             match store(StreamReader::new(body), &file).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(n) => {
+                    cache.added(&rel, n);
+                    StatusCode::CREATED.into_response()
+                }
                 Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
             }
         }
-        Method::DELETE => match fs::remove_file(&file).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => StatusCode::NO_CONTENT.into_response(),
-            Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
-        },
+        Method::DELETE => {
+            cache.forget(&rel);
+            match fs::remove_file(&file).await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
+            }
+        }
         _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
     }
 }
 
-fn file_response(rel: &str, body: Body) -> Response {
-    (
-        [
-            (header::CACHE_CONTROL, cache_control(rel)),
-            (header::CONTENT_TYPE, "application/octet-stream"),
-        ],
-        body,
-    )
-        .into_response()
+/// The local file (Range and HEAD included, so ISO downloads resume).
+async fn serve(rel: &str, file: &Path, req: Request) -> Response {
+    let mut r = match ServeFile::new(file).oneshot(req).await {
+        Ok(r) => r.map(Body::new),
+        Err(e) => match e {},
+    };
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control(rel)),
+    );
+    r
 }
 
-async fn open(file: &Path) -> Option<fs::File> {
-    let f = fs::File::open(file).await.ok()?;
-    f.metadata().await.ok()?.is_file().then_some(f)
-}
-
-/// Local file, else the origin's copy: immutable files are stored for the next request.
-async fn get(file: &Path, rel: &str, origin: &str, client: &reqwest::Client) -> Response {
-    if let Some(f) = open(file).await {
-        return file_response(rel, Body::from_stream(ReaderStream::new(f)));
+/// Local file, else the upstream copy: immutable files are stored for the next request.
+async fn get(ctx: &Ctx, file: &Path, rel: &str, req: Request) -> Response {
+    if fs::metadata(file).await.is_ok_and(|m| m.is_file()) {
+        ctx.cache.touch(rel);
+        let r = serve(rel, file, req).await;
+        ctx.cache.hit(len(&r), false);
+        return r;
     }
-    if origin.is_empty() {
+    let Some(url) = upstream(rel, &ctx.cfg.mirrors, &ctx.cfg.origin) else {
         return text(StatusCode::NOT_FOUND, "not found\n");
-    }
-    let url = format!("{}/{rel}", origin.trim_end_matches('/'));
-    let resp = match client.get(&url).send().await {
+    };
+    let resp = match ctx.client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return text(StatusCode::NOT_FOUND, "not found\n"),
     };
     let stream = resp.bytes_stream().map_err(io::Error::other);
-    if !cache_control(rel).contains("immutable") {
-        return file_response(rel, Body::from_stream(stream));
+    if !immutable(rel) {
+        ctx.cache.hit(0, true);
+        let mut r = Body::from_stream(stream).into_response();
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        return r;
     }
-    if store(StreamReader::new(stream), file).await.is_err() {
-        return text(StatusCode::BAD_GATEWAY, "origin fetch failed\n");
+    let n = match store(StreamReader::new(stream), file).await {
+        Ok(n) => n,
+        Err(_) => return text(StatusCode::BAD_GATEWAY, "upstream fetch failed\n"),
+    };
+    for gone in ctx.cache.added(rel, n) {
+        eprintln!("evict {gone}");
     }
-    match open(file).await {
-        Some(f) => file_response(rel, Body::from_stream(ReaderStream::new(f))),
-        None => text(StatusCode::NOT_FOUND, "not found\n"),
-    }
+    ctx.cache.hit(n, true);
+    serve(rel, file, req).await
 }
 
-/// Write `src` to `file` through a temp file in the same directory, then rename.
-async fn store(mut src: impl tokio::io::AsyncRead + Unpin, file: &Path) -> io::Result<()> {
+fn len(r: &Response) -> u64 {
+    r.headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write `src` to `file` through a temp file in the same directory, then rename. Returns the size.
+async fn store(mut src: impl tokio::io::AsyncRead + Unpin, file: &Path) -> io::Result<u64> {
     let parent = file.parent().expect("file in bucket");
     fs::create_dir_all(parent).await?;
     let nanos = std::time::SystemTime::now()
@@ -161,10 +219,11 @@ async fn store(mut src: impl tokio::io::AsyncRead + Unpin, file: &Path) -> io::R
     let tmp = parent.join(format!(".upload-{}-{nanos}", std::process::id()));
     let res = async {
         let mut f = fs::File::create(&tmp).await?;
-        tokio::io::copy(&mut src, &mut f).await?;
+        let n = tokio::io::copy(&mut src, &mut f).await?;
         f.flush().await?;
         f.sync_all().await?;
-        fs::rename(&tmp, file).await
+        fs::rename(&tmp, file).await?;
+        Ok(n)
     }
     .await;
     if res.is_err() {
@@ -202,5 +261,27 @@ mod tests {
         assert!(constant_eq(b"Bearer s", b"Bearer s"));
         assert!(!constant_eq(b"Bearer s", b"Bearer t"));
         assert!(!constant_eq(b"Bearer", b"Bearer s"));
+    }
+
+    #[test]
+    fn mirrors_by_first_segment_rest_from_the_origin() {
+        let m = mirrors(
+            "archive=https://archive.archlinux.org/, cachy=https://mirror.cachyos.org/repo,bad",
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            upstream(
+                "archive/repos/2026/10/20/core/os/x86_64/a.pkg.tar.zst",
+                &m,
+                "https://o"
+            )
+            .as_deref(),
+            Some("https://archive.archlinux.org/repos/2026/10/20/core/os/x86_64/a.pkg.tar.zst")
+        );
+        assert_eq!(
+            upstream("wolos-2026-10-20/b.pkg.tar.zst", &m, "https://o/").as_deref(),
+            Some("https://o/wolos-2026-10-20/b.pkg.tar.zst")
+        );
+        assert_eq!(upstream("x/y", &m, ""), None);
     }
 }
