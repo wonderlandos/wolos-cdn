@@ -1,0 +1,16 @@
+# wolos-cdn
+
+The WolOS package bucket on Square Cloud. `GET /<path>` serves a file; a missing one is pulled once from
+`ORIGIN` (GitHub release downloads, `<repo>-<date>/<file>`), kept on disk when it never changes
+(packages, ISOs) and passed through when it does (databases, manifests, signatures).
+`PUT`/`DELETE /<path>` with `Authorization: Bearer $UPLOAD_TOKEN` change files; writes are atomic.
+
+| env | default | |
+|---|---|---|
+| `PORT` | 80 | listen port |
+| `DATA_DIR` | `data` | bucket directory |
+| `UPLOAD_TOKEN` | unset (read only) | set in the Square Cloud dashboard, never in this repo |
+| `ORIGIN` | unset | base URL for pull-through |
+| `WORKERS` | 8 | threads |
+
+`cargo test` runs the server end to end.

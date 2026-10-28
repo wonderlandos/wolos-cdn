@@ -1,0 +1,12 @@
+[package]
+name = "wolos-cdn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tiny_http = "0.12"
+ureq = "2"
+
+[dev-dependencies]
+tiny_http = "0.12"
+ureq = "2"
