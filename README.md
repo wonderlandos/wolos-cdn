@@ -13,4 +13,4 @@ The WolOS package bucket on Square Cloud. `GET /<path>` serves a file; a missing
 | `ORIGIN` | unset | base URL for pull-through |
 | `WORKERS` | 8 | threads |
 
-`cargo test` runs the server end to end.
+Deployed on Square Cloud from the `Dockerfile` (settings in the dashboard; set `UPLOAD_TOKEN` there). `cargo test` runs the server end to end.
