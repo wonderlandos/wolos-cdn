@@ -4,9 +4,12 @@
 //!
 //! Env: HOST (0.0.0.0) and PORT (80) as the hosting runtime sets them, DATA_DIR (./data),
 //! UPLOAD_TOKEN (required for writes; unset = read only), ORIGIN (base URL missing files are pulled
-//! from and kept; unset = none).
+//! from and kept; unset = none), MIRRORS (`name=url,...`: `/name/x` pulls `url/x`), MAX_BYTES
+//! (disk budget, 7 GiB: least recently used packages and ISOs are evicted past it).
 
 mod bucket;
+mod cache;
+mod page;
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +20,8 @@ async fn main() {
         dir: dir.clone(),
         token: std::env::var("UPLOAD_TOKEN").unwrap_or_default(),
         origin: std::env::var("ORIGIN").unwrap_or_default(),
+        mirrors: bucket::mirrors(&std::env::var("MIRRORS").unwrap_or_default()),
+        max_bytes: env("MAX_BYTES", "7516192768").parse().expect("MAX_BYTES"),
     };
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("listen");
     eprintln!("wolos-cdn: serving {} on {addr}", dir.display());
