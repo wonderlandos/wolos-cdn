@@ -3,10 +3,12 @@ name = "wolos-cdn"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-tiny_http = "0.12"
+[dev-dependencies]
 ureq = "2"
 
-[dev-dependencies]
-tiny_http = "0.12"
-ureq = "2"
+[dependencies]
+axum = "0.8"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
