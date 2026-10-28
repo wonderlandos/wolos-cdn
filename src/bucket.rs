@@ -78,6 +78,12 @@ fn status(req: Request, code: u16, text: &str) {
 }
 
 fn handle(mut req: Request, cfg: &Config) {
+    eprintln!(
+        "{} {} {}",
+        req.method(),
+        req.url(),
+        req.remote_addr().map(|a| a.to_string()).unwrap_or_default()
+    );
     let (dir, token) = (cfg.dir.as_path(), cfg.token.as_str());
     if req.url() == "/healthz" {
         return status(req, 200, "ok\n");
