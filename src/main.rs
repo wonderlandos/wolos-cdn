@@ -10,7 +10,8 @@ mod bucket;
 fn main() {
     let dir = std::path::PathBuf::from(env("DATA_DIR", "data"));
     std::fs::create_dir_all(&dir).expect("DATA_DIR");
-    let addr = format!("0.0.0.0:{}", env("PORT", "80"));
+    // [::] takes IPv4 and IPv6 (Linux dual-stack): the hosting proxy may connect over either.
+    let addr = format!("{}:{}", env("HOST", "[::]"), env("PORT", "80"));
     let cfg = bucket::Config {
         dir: dir.clone(),
         token: std::env::var("UPLOAD_TOKEN").unwrap_or_default(),
