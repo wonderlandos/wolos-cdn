@@ -82,6 +82,13 @@ fn handle(mut req: Request, cfg: &Config) {
     if req.url() == "/healthz" {
         return status(req, 200, "ok\n");
     }
+    if req.url() == "/" {
+        return status(
+            req,
+            200,
+            "WolOS package mirror. pacman: Server = <this host>/$repo-<release>\n",
+        );
+    }
     let Some(rel) = clean(req.url()) else {
         return status(req, 400, "bad path\n");
     };
