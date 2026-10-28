@@ -106,18 +106,36 @@ fn upload_serve_delete() {
 /// A missing file is fetched once from ORIGIN (GitHub release assets), stored, then served locally.
 #[test]
 fn pulls_through_from_the_origin() {
-    let origin = tiny_http::Server::http("127.0.0.1:18440").unwrap();
+    // A one-route origin on a plain socket: 200 for the package, 404 for anything else.
+    let origin = std::net::TcpListener::bind("127.0.0.1:18440").unwrap();
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let h = hits.clone();
     std::thread::spawn(move || {
-        for req in origin.incoming_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        for mut conn in origin.incoming().flatten() {
             h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let r = if req.url() == "/wolos-2026-10-20/b-1-1-x86_64.pkg.tar.zst" {
-                tiny_http::Response::from_string("from-origin").with_status_code(200)
+            let mut line = String::new();
+            let mut rd = BufReader::new(conn.try_clone().unwrap());
+            rd.read_line(&mut line).unwrap();
+            while let Ok(n) = {
+                let mut l = String::new();
+                rd.read_line(&mut l)
+                    .map(|n| if l == "\r\n" { 0 } else { n })
+            } {
+                if n == 0 {
+                    break;
+                }
+            }
+            let (code, body) = if line.contains(" /wolos-2026-10-20/b-1-1-x86_64.pkg.tar.zst ") {
+                ("200 OK", "from-origin")
             } else {
-                tiny_http::Response::from_string("nope").with_status_code(404)
+                ("404 Not Found", "nope")
             };
-            let _ = req.respond(r);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 {code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
         }
     });
     let s = start_with("pull", 18433, &[("ORIGIN", "http://127.0.0.1:18440")]);

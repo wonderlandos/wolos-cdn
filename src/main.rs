@@ -2,24 +2,27 @@
 //! PUT and DELETE with the upload token change them. Writes are atomic (temp file + rename), so a
 //! pacman client never sees half a database.
 //!
-//! Env: PORT (80), DATA_DIR (./data), UPLOAD_TOKEN (required for writes; unset = read only),
-//! WORKERS (threads, 8), ORIGIN (base URL missing files are pulled from and kept; unset = none).
+//! Env: HOST (0.0.0.0) and PORT (80) as the hosting runtime sets them, DATA_DIR (./data),
+//! UPLOAD_TOKEN (required for writes; unset = read only), ORIGIN (base URL missing files are pulled
+//! from and kept; unset = none).
 
 mod bucket;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let dir = std::path::PathBuf::from(env("DATA_DIR", "data"));
     std::fs::create_dir_all(&dir).expect("DATA_DIR");
-    // [::] takes IPv4 and IPv6 (Linux dual-stack): the hosting proxy may connect over either.
-    let addr = format!("{}:{}", env("HOST", "[::]"), env("PORT", "80"));
+    let addr = format!("{}:{}", env("HOST", "0.0.0.0"), env("PORT", "80"));
     let cfg = bucket::Config {
         dir: dir.clone(),
         token: std::env::var("UPLOAD_TOKEN").unwrap_or_default(),
         origin: std::env::var("ORIGIN").unwrap_or_default(),
     };
-    let workers = env("WORKERS", "8").parse().unwrap_or(8);
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("listen");
     eprintln!("wolos-cdn: serving {} on {addr}", dir.display());
-    bucket::serve(&addr, cfg, workers);
+    axum::serve(listener, bucket::app(cfg))
+        .await
+        .expect("serve");
 }
 
 fn env(k: &str, default: &str) -> String {

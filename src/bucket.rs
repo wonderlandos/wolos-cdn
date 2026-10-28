@@ -1,28 +1,16 @@
 //! Request handling: path rules, auth, cache headers, atomic writes, pull-through from ORIGIN.
-use std::fs;
-use std::io::{self, Write};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use futures_util::TryStreamExt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tiny_http::{Header, Method, Request, Response, Server};
-
-/// Run until the process dies; `workers` threads share one listener.
-pub fn serve(addr: &str, cfg: Config, workers: usize) {
-    let server = Arc::new(Server::http(addr).expect("listen"));
-    let ctx = Arc::new(cfg);
-    let threads: Vec<_> = (0..workers.max(1))
-        .map(|_| {
-            let (server, ctx) = (server.clone(), ctx.clone());
-            std::thread::spawn(move || {
-                for req in server.incoming_requests() {
-                    handle(req, &ctx);
-                }
-            })
-        })
-        .collect();
-    for t in threads {
-        let _ = t.join();
-    }
-}
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 pub struct Config {
     pub dir: PathBuf,
@@ -30,6 +18,14 @@ pub struct Config {
     pub token: String,
     /// Base URL a missing file is fetched from (GitHub release downloads); empty = none.
     pub origin: String,
+}
+
+type Ctx = Arc<(Config, reqwest::Client)>;
+
+pub fn app(cfg: Config) -> Router {
+    Router::new()
+        .fallback(handle)
+        .with_state(Arc::new((cfg, reqwest::Client::new())))
 }
 
 /// A URL path as a relative path inside the bucket; directories, `..` and backslashes fail.
@@ -57,131 +53,122 @@ pub fn cache_control(rel: &str) -> &'static str {
     }
 }
 
-fn authorized(req: &Request, token: &str) -> bool {
-    let want = format!("Bearer {token}");
-    !token.is_empty()
-        && req.headers().iter().any(|h| {
-            h.field.equiv("Authorization") && constant_eq(h.value.as_bytes(), want.as_bytes())
-        })
-}
-
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-fn header(k: &str, v: &str) -> Header {
-    Header::from_bytes(k.as_bytes(), v.as_bytes()).expect("ascii header")
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    let want = format!("Bearer {token}");
+    !token.is_empty()
+        && headers
+            .get(header::AUTHORIZATION)
+            .is_some_and(|v| constant_eq(v.as_bytes(), want.as_bytes()))
 }
 
-fn status(req: Request, code: u16, text: &str) {
-    let _ = req.respond(Response::from_string(text).with_status_code(code));
+fn text(code: StatusCode, msg: &str) -> Response {
+    (code, msg.to_string()).into_response()
 }
 
-fn handle(mut req: Request, cfg: &Config) {
-    eprintln!(
-        "{} {} {}",
-        req.method(),
-        req.url(),
-        req.remote_addr().map(|a| a.to_string()).unwrap_or_default()
-    );
-    let (dir, token) = (cfg.dir.as_path(), cfg.token.as_str());
-    if req.url() == "/healthz" {
-        return status(req, 200, "ok\n");
-    }
-    if req.url() == "/" {
-        return status(
-            req,
-            200,
-            "WolOS package mirror. pacman: Server = <this host>/$repo-<release>\n",
-        );
-    }
-    let Some(rel) = clean(req.url()) else {
-        return status(req, 400, "bad path\n");
-    };
-    let file = dir.join(&rel);
-    match req.method() {
-        Method::Get | Method::Head => match open_or_pull(&file, &rel, &cfg.origin) {
-            Some(Body::File(f)) => {
-                let r = Response::from_file(f)
-                    .with_header(header("Cache-Control", cache_control(&rel)))
-                    .with_header(header("Content-Type", "application/octet-stream"));
-                let _ = req.respond(r);
-            }
-            Some(Body::Fresh(bytes)) => {
-                let r = Response::from_data(bytes)
-                    .with_header(header("Cache-Control", cache_control(&rel)))
-                    .with_header(header("Content-Type", "application/octet-stream"));
-                let _ = req.respond(r);
-            }
-            None => status(req, 404, "not found\n"),
-        },
-        Method::Put | Method::Delete if !authorized(&req, token) => {
-            status(req, 401, "unauthorized\n")
+async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
+    let (cfg, client) = (&ctx.0, &ctx.1);
+    let path = req.uri().path().to_string();
+    eprintln!("{} {path}", req.method());
+    match path.as_str() {
+        "/healthz" => return text(StatusCode::OK, "ok\n"),
+        "/" => {
+            return text(
+                StatusCode::OK,
+                "WolOS package mirror. pacman: Server = <this host>/$repo-<release>\n",
+            );
         }
-        Method::Put => match put(&mut req, &file) {
-            Ok(()) => status(req, 201, ""),
-            Err(e) => status(req, 500, &format!("{e}\n")),
+        _ => {}
+    }
+    let Some(rel) = clean(&path) else {
+        return text(StatusCode::BAD_REQUEST, "bad path\n");
+    };
+    let file = cfg.dir.join(&rel);
+    match *req.method() {
+        Method::GET | Method::HEAD => get(&file, &rel, &cfg.origin, client).await,
+        Method::PUT | Method::DELETE if !authorized(req.headers(), &cfg.token) => {
+            text(StatusCode::UNAUTHORIZED, "unauthorized\n")
+        }
+        Method::PUT => {
+            let body = req.into_body().into_data_stream().map_err(io::Error::other);
+            match store(StreamReader::new(body), &file).await {
+                Ok(()) => StatusCode::CREATED.into_response(),
+                Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
+            }
+        }
+        Method::DELETE => match fs::remove_file(&file).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
         },
-        Method::Delete => match fs::remove_file(&file) {
-            Ok(()) => status(req, 204, ""),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => status(req, 204, ""),
-            Err(e) => status(req, 500, &format!("{e}\n")),
-        },
-        _ => status(req, 405, "method not allowed\n"),
+        _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
     }
 }
 
-enum Body {
-    File(fs::File),
-    /// Fetched from the origin and not stored (it changes on every publish).
-    Fresh(Vec<u8>),
+fn file_response(rel: &str, body: Body) -> Response {
+    (
+        [
+            (header::CACHE_CONTROL, cache_control(rel)),
+            (header::CONTENT_TYPE, "application/octet-stream"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn open(file: &Path) -> Option<fs::File> {
+    let f = fs::File::open(file).await.ok()?;
+    f.metadata().await.ok()?.is_file().then_some(f)
 }
 
 /// Local file, else the origin's copy: immutable files are stored for the next request.
-fn open_or_pull(file: &Path, rel: &str, origin: &str) -> Option<Body> {
-    if let Ok(f) = fs::File::open(file)
-        && f.metadata().is_ok_and(|m| m.is_file())
-    {
-        return Some(Body::File(f));
+async fn get(file: &Path, rel: &str, origin: &str, client: &reqwest::Client) -> Response {
+    if let Some(f) = open(file).await {
+        return file_response(rel, Body::from_stream(ReaderStream::new(f)));
     }
     if origin.is_empty() {
-        return None;
+        return text(StatusCode::NOT_FOUND, "not found\n");
     }
-    let resp = ureq::get(&format!("{}/{rel}", origin.trim_end_matches('/')))
-        .call()
-        .ok()?;
-    let mut reader = resp.into_reader();
+    let url = format!("{}/{rel}", origin.trim_end_matches('/'));
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return text(StatusCode::NOT_FOUND, "not found\n"),
+    };
+    let stream = resp.bytes_stream().map_err(io::Error::other);
     if !cache_control(rel).contains("immutable") {
-        let mut v = Vec::new();
-        io::copy(&mut reader, &mut v).ok()?;
-        return Some(Body::Fresh(v));
+        return file_response(rel, Body::from_stream(stream));
     }
-    store(&mut reader, file).ok()?;
-    fs::File::open(file).ok().map(Body::File)
-}
-
-fn put(req: &mut Request, file: &Path) -> io::Result<()> {
-    store(req.as_reader(), file)
+    if store(StreamReader::new(stream), file).await.is_err() {
+        return text(StatusCode::BAD_GATEWAY, "origin fetch failed\n");
+    }
+    match open(file).await {
+        Some(f) => file_response(rel, Body::from_stream(ReaderStream::new(f))),
+        None => text(StatusCode::NOT_FOUND, "not found\n"),
+    }
 }
 
 /// Write `src` to `file` through a temp file in the same directory, then rename.
-fn store(src: &mut dyn io::Read, file: &Path) -> io::Result<()> {
+async fn store(mut src: impl tokio::io::AsyncRead + Unpin, file: &Path) -> io::Result<()> {
     let parent = file.parent().expect("file in bucket");
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".upload-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let res = (|| {
-        let mut f = fs::File::create(&tmp)?;
-        io::copy(src, &mut f)?;
-        f.flush()?;
-        f.sync_all()?;
-        fs::rename(&tmp, file)
-    })();
+    fs::create_dir_all(parent).await?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".upload-{}-{nanos}", std::process::id()));
+    let res = async {
+        let mut f = fs::File::create(&tmp).await?;
+        tokio::io::copy(&mut src, &mut f).await?;
+        f.flush().await?;
+        f.sync_all().await?;
+        fs::rename(&tmp, file).await
+    }
+    .await;
     if res.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp).await;
     }
     res
 }
