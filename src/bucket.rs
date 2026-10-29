@@ -1,6 +1,7 @@
 //! Request handling: path rules, auth, cache headers, atomic writes, pull-through from mirrors.
 use crate::cache::{Cache, immutable};
 use crate::page;
+use crate::report::{self, Reports};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -26,23 +27,30 @@ pub struct Config {
     pub mirrors: Vec<(String, String)>,
     /// Disk budget in bytes for the bucket.
     pub max_bytes: u64,
+    /// Where error reports are kept (outside `dir`).
+    pub reports: PathBuf,
 }
 
 struct Ctx {
     cfg: Config,
     client: reqwest::Client,
     cache: Cache,
+    reports: Reports,
 }
 
 pub fn app(cfg: Config) -> Router {
     let cache = Cache::open(&cfg.dir, cfg.max_bytes);
+    let reports = Reports::open(cfg.reports.clone());
     let client = reqwest::Client::builder()
         .user_agent("wolos-cdn")
         .build()
         .expect("http client");
-    Router::new()
-        .fallback(handle)
-        .with_state(Arc::new(Ctx { cfg, client, cache }))
+    Router::new().fallback(handle).with_state(Arc::new(Ctx {
+        cfg,
+        client,
+        cache,
+        reports,
+    }))
 }
 
 /// `name=url,name=url` (MIRRORS env) as prefix pairs.
@@ -105,6 +113,31 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
             .is_some_and(|v| constant_eq(v.as_bytes(), want.as_bytes()))
 }
 
+/// POST: keep an error report (anyone). GET `?days=N`: read them (the token).
+async fn report(ctx: &Ctx, req: Request) -> Response {
+    match *req.method() {
+        Method::POST => match axum::body::to_bytes(req.into_body(), report::MAX_BODY).await {
+            Ok(b) => ctx.reports.post(&b).into_response(),
+            Err(_) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        },
+        Method::GET if authorized(req.headers(), &ctx.cfg.token) => {
+            let days = req
+                .uri()
+                .query()
+                .and_then(|q| q.strip_prefix("days="))
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(1);
+            (
+                [(header::CONTENT_TYPE, "application/x-ndjson")],
+                ctx.reports.read(days),
+            )
+                .into_response()
+        }
+        Method::GET => text(StatusCode::UNAUTHORIZED, "unauthorized\n"),
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
 fn text(code: StatusCode, msg: &str) -> Response {
     (code, msg.to_string()).into_response()
 }
@@ -115,10 +148,16 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     let (cfg, cache) = (&ctx.cfg, &ctx.cache);
     match path.as_str() {
         "/healthz" => return text(StatusCode::OK, "ok\n"),
-        "/" => return Html(page::html(cache, &cfg.mirrors, &cfg.origin)).into_response(),
-        "/stats" => {
-            return axum::Json(page::stats(cache, &cfg.mirrors, &cfg.origin)).into_response();
+        "/" => {
+            let r = ctx.reports.today();
+            return Html(page::html(cache, &cfg.mirrors, &cfg.origin, &r)).into_response();
         }
+        "/stats" => {
+            let mut v = page::stats(cache, &cfg.mirrors, &cfg.origin);
+            v["reports_today"] = serde_json::json!(ctx.reports.today());
+            return axum::Json(v).into_response();
+        }
+        "/report" => return report(&ctx, req).await,
         _ => {}
     }
     let Some(rel) = clean(&path) else {
