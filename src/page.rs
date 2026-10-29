@@ -29,7 +29,13 @@ pub fn stats(c: &Cache, mirrors: &[(String, String)], origin: &str) -> serde_jso
     })
 }
 
-pub fn html(c: &Cache, mirrors: &[(String, String)], origin: &str) -> String {
+/// `reports`: today's error reports by kind.
+pub fn html(
+    c: &Cache,
+    mirrors: &[(String, String)],
+    origin: &str,
+    reports: &std::collections::HashMap<String, u64>,
+) -> String {
     let (used, max) = (c.used(), c.max.max(1));
     let (hits, misses) = (
         c.hits.load(Ordering::Relaxed),
@@ -57,6 +63,19 @@ pub fn html(c: &Cache, mirrors: &[(String, String)], origin: &str) -> String {
             human(size)
         );
     }
+    let mut kinds: Vec<_> = reports.iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let mut errs = String::new();
+    for (k, n) in &kinds {
+        errs += &format!(
+            "<tr><td><code>{}</code></td><td class=n>{n}</td></tr>",
+            esc(k)
+        );
+    }
+    if errs.is_empty() {
+        errs = "<tr><td>None today</td></tr>".into();
+    }
+    let total: u64 = reports.values().sum();
     format!(
         r#"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>WolOS CDN</title><meta http-equiv=refresh content=15>
@@ -77,7 +96,9 @@ h2{{font-size:17px;margin:0 0 8px}}code{{font:13px ui-monospace,monospace}}
 <div class=c><div class=k>Storage</div><div class=v>{used_h}</div><div class=k>of {max_h} ({pct}%)</div><div class=bar><i></i></div></div>
 <div class=c><div class=k>Cache hit rate</div><div class=v>{rate}%</div><div class=k>{hits} hits, {misses} fetched</div></div>
 <div class=c><div class=k>Files</div><div class=v>{files}</div><div class=k>{sent} served</div></div>
+<div class=c><div class=k>Error reports today</div><div class=v>{total}</div><div class=k>from machines that send them</div></div>
 </div>
+<div class=c style="margin-bottom:16px"><h2>Errors today</h2><table>{errs}</table></div>
 <div class=c style="margin-bottom:16px"><h2>Sources</h2><table>{rows}</table></div>
 <div class=c><h2>Recently used</h2><table>{recent}</table></div>
 </main></html>"#,

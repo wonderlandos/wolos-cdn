@@ -202,3 +202,59 @@ fn budget_range_and_page() {
         .unwrap();
     assert!(stats.contains("\"max\":10"), "{stats}");
 }
+
+/// Error reports: anyone posts a small JSON object (no address kept); only the token reads them.
+#[test]
+fn reports_are_kept_and_read_with_the_token() {
+    let s = start("report", 18450);
+    let url = format!("{}/report", s.base);
+    let ok = r#"{"kind":"unit-failed","version":"0.11.2","detail":"wold.service"}"#;
+    assert_eq!(code(ureq::post(&url).send_string(ok)), 204);
+    assert_eq!(code(ureq::post(&url).send_string("not json")), 400);
+    assert_eq!(
+        code(ureq::post(&url).send_string(r#"{"version":"1"}"#)),
+        400,
+        "kind required"
+    );
+    assert_eq!(
+        code(ureq::post(&url).send_string(r#"{"kind":"Bad Kind!"}"#)),
+        400
+    );
+    let big = format!(r#"{{"kind":"crash","detail":"{}"}}"#, "x".repeat(20_000));
+    assert_eq!(code(ureq::post(&url).send_string(&big)), 413);
+
+    assert_eq!(code(ureq::get(&url).call()), 401);
+    let body = ureq::get(&url)
+        .set("Authorization", "Bearer secret")
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    let lines: Vec<serde_json::Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{body}");
+    assert_eq!(lines[0]["kind"], "unit-failed");
+    assert_eq!(lines[0]["detail"], "wold.service");
+    assert!(lines[0]["at"].as_u64().unwrap() > 1_700_000_000);
+    assert!(!body.contains("127.0.0.1"), "no client address kept");
+
+    // Not served as a bucket file, counted on /stats.
+    assert_eq!(code(ureq::get(&format!("{}/reports", s.base)).call()), 404);
+    let stats: serde_json::Value = serde_json::from_str(
+        &ureq::get(&format!("{}/stats", s.base))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stats["reports_today"]["unit-failed"], 1, "{stats}");
+    let page = ureq::get(&format!("{}/", s.base))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(page.contains("Errors today") && page.contains("unit-failed"));
+}
