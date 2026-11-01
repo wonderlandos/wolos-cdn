@@ -144,10 +144,14 @@ fn pulls_through_from_the_origin() {
         ureq::get(&url).call().unwrap().into_string().unwrap(),
         "from-origin"
     );
+    // Binary files are downloads: the browser saves them instead of showing the bytes.
+    let r = ureq::get(&url).call().unwrap();
+    assert_eq!(r.header("content-type"), Some("application/octet-stream"));
     assert_eq!(
-        ureq::get(&url).call().unwrap().into_string().unwrap(),
-        "from-origin"
+        r.header("content-disposition"),
+        Some("attachment; filename=\"b-1-1-x86_64.pkg.tar.zst\"")
     );
+    assert_eq!(r.into_string().unwrap(), "from-origin");
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         1,

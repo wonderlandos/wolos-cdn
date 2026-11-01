@@ -193,6 +193,32 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     }
 }
 
+/// Binary files (packages, ISOs, archives, signatures, databases) are downloads: the browser
+/// saves them instead of showing the bytes. Text files (checksums, JSON, pages) keep their type.
+pub fn is_download(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    [
+        ".zst", ".iso", ".img", ".xz", ".gz", ".tar", ".sig", ".db", ".files", ".efi", ".asc",
+    ]
+    .iter()
+    .any(|ext| name.ends_with(ext))
+}
+
+fn download_headers(rel: &str, r: &mut Response) {
+    if !is_download(rel) {
+        return;
+    }
+    let name = rel.rsplit('/').next().unwrap_or(rel).replace('"', "");
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+}
+
 /// The local file (Range and HEAD included, so ISO downloads resume).
 async fn serve(rel: &str, file: &Path, req: Request) -> Response {
     let mut r = match ServeFile::new(file).oneshot(req).await {
@@ -203,6 +229,7 @@ async fn serve(rel: &str, file: &Path, req: Request) -> Response {
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control(rel)),
     );
+    download_headers(rel, &mut r);
     r
 }
 
@@ -227,6 +254,7 @@ async fn get(ctx: &Ctx, file: &Path, rel: &str, req: Request) -> Response {
         let mut r = Body::from_stream(stream).into_response();
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        download_headers(rel, &mut r);
         return r;
     }
     let n = match store(StreamReader::new(stream), file).await {
