@@ -113,6 +113,24 @@ fn link(v: &Value) -> Option<String> {
     .then(|| s.to_string())
 }
 
+/// A URL to this release folder on this host: a local path, or any host whose path is
+/// `/<folder>/<file>` (the CDN layout; GitHub assets live under `/<owner>/<repo>/releases/`).
+/// The server does not know its public name, so the path decides.
+fn on_this_host(url: &str, folder: &str) -> bool {
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]),
+        None => url,
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path.starts_with('/')
+        && (!url.contains("://")
+            || path
+                .strip_prefix('/')
+                .and_then(|p| p.strip_prefix(folder))
+                .and_then(|p| p.strip_prefix('/'))
+                .is_some_and(|f| !f.is_empty() && !f.contains('/')))
+}
+
 fn hex64(s: &str) -> Option<String> {
     let s = s.trim().to_ascii_lowercase();
     (s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())).then_some(s)
@@ -172,9 +190,15 @@ fn read_release(dir: &Path, folder: &str, version: Version) -> Option<Release> {
     if !rj.is_object() {
         return None;
     }
-    let mirror = link(&rj["image"]);
-    let want = mirror
+    // `image` is this host's copy (`https://<cdn>/v0.12.0/x.iso`), `mirror` the GitHub one; an
+    // older release.json has only `image`, pointing at GitHub.
+    let image = link(&rj["image"]);
+    let mirror = link(&rj["mirror"])
+        .filter(|m| !on_this_host(m, folder))
+        .or_else(|| image.clone().filter(|i| !on_this_host(i, folder)));
+    let want = image
         .as_deref()
+        .or(mirror.as_deref())
         .and_then(|m| m.rsplit('/').next())
         .map(String::from);
     // The ISO release.json names, else the newest one in the folder.
@@ -335,6 +359,29 @@ mod tests {
         assert!(folder_version("v0.12.0").is_some());
         assert!(folder_version("0.12.0").is_none() && folder_version("vx").is_none());
         assert!(in_release("v0.12.0/a.iso") && !in_release("v0.12.0") && !in_release("iso/a.iso"));
+    }
+
+    #[test]
+    fn own_copies_are_not_mirrors() {
+        let gh = "https://github.com/wonderlandos/wolos-packages/releases/download/v0.12.0/x.iso";
+        assert!(!on_this_host(gh, "v0.12.0"));
+        assert!(on_this_host(
+            "https://wolos.squareweb.app/v0.12.0/x.iso",
+            "v0.12.0"
+        ));
+        assert!(on_this_host(
+            "http://127.0.0.1:8080/v0.12.0/x.iso?dl=1",
+            "v0.12.0"
+        ));
+        assert!(on_this_host("/v0.12.0/x.iso", "v0.12.0"));
+        assert!(!on_this_host(
+            "https://cdn.example/v0.11.4/x.iso",
+            "v0.12.0"
+        ));
+        assert!(!on_this_host(
+            "https://cdn.example/a/v0.12.0/x.iso",
+            "v0.12.0"
+        ));
     }
 
     #[test]

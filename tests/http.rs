@@ -925,3 +925,59 @@ fn index_rebuilds_after_chunked_complete() {
     assert_eq!(after["sha256"], sha);
     assert_eq!(after["date"], "2026-11-04");
 }
+
+/// release.json as the tooling writes it now: `image` is the CDN copy, `mirror` the GitHub one.
+/// The index takes `mirror`; an `image` on this host is never a mirror (an evicted ISO would
+/// link to itself); an older release.json with only a GitHub `image` still has it as the mirror.
+#[test]
+fn mirror_is_the_github_copy_not_this_host() {
+    let cdn = "https://wolos.squareweb.app";
+    let s = start_in("rel-mirror", 18474, &[], |b| {
+        // Both evicted: release.json only.
+        for (v, extra) in [
+            (
+                "0.12.0",
+                serde_json::json!({"mirror": format!("{GH}/v0.12.0/wolos-a.iso")}),
+            ),
+            ("0.12.1", serde_json::json!({})),
+        ] {
+            let d = b.join(format!("v{v}"));
+            std::fs::create_dir_all(&d).unwrap();
+            let mut rj =
+                serde_json::json!({"version": v, "image": format!("{cdn}/v{v}/wolos-a.iso")});
+            for (k, val) in extra.as_object().unwrap() {
+                rj[k] = val.clone();
+            }
+            std::fs::write(d.join("release.json"), rj.to_string()).unwrap();
+        }
+        // Old layout: only `image`, on GitHub.
+        release(b, "0.11.4", "wolos-old.iso", None, serde_json::json!({}));
+    });
+    let list = get_json(&format!("{}/releases.json", s.base))["releases"].clone();
+    let mirrors: Vec<_> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["version"].clone(), r["iso"].clone(), r["mirror"].clone()))
+        .collect();
+    let null = serde_json::Value::Null;
+    assert_eq!(
+        mirrors,
+        [
+            ("0.12.1".into(), null.clone(), null.clone()),
+            (
+                "0.12.0".into(),
+                null.clone(),
+                format!("{GH}/v0.12.0/wolos-a.iso").into()
+            ),
+            (
+                "0.11.4".into(),
+                null.clone(),
+                format!("{GH}/v0.11.4/wolos-old.iso").into()
+            ),
+        ]
+    );
+    let page = get_text(&format!("{}/releases", s.base));
+    assert!(!page.contains(&format!("href=\"{cdn}/")), "{page}");
+    assert!(page.contains("release.json names no mirror"), "{page}");
+}
