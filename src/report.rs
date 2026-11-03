@@ -119,6 +119,11 @@ fn now() -> u64 {
 
 /// `YYYY-MM-DD.jsonl` for a day since the epoch (civil date, UTC).
 fn file(day: u64) -> String {
+    format!("{}.jsonl", date(day))
+}
+
+/// `YYYY-MM-DD` for a day since the epoch (civil date, UTC).
+pub fn date(day: u64) -> String {
     let z = day as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -128,7 +133,7 @@ fn file(day: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}.jsonl")
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! pull-through from mirrors.
 use crate::cache::{Cache, immutable};
 use crate::page;
+use crate::releases::Releases;
 use crate::report::{self, Reports};
 use crate::upload::{self, Uploads};
 use axum::Router;
@@ -41,6 +42,7 @@ struct Ctx {
     cache: Cache,
     reports: Reports,
     uploads: Uploads,
+    releases: Releases,
 }
 
 pub fn app(cfg: Config) -> Router {
@@ -49,6 +51,7 @@ pub fn app(cfg: Config) -> Router {
     let reports = Reports::open(cfg.reports.clone());
     let uploads = Uploads::new(&cfg.dir, cfg.max_bytes);
     uploads.sweep(true);
+    let releases = Releases::new(&cfg.dir);
     let client = reqwest::Client::builder()
         .user_agent("wolos-cdn")
         .build()
@@ -59,6 +62,7 @@ pub fn app(cfg: Config) -> Router {
         cache,
         reports,
         uploads,
+        releases,
     });
     let weak = Arc::downgrade(&ctx);
     std::thread::spawn(move || {
@@ -177,11 +181,61 @@ fn stored(ctx: &Ctx, rel: &str, n: u64) -> Vec<String> {
     let removed = upload::keep_latest(&ctx.cfg.dir, rel, ctx.cfg.keep_isos);
     for r in &removed {
         ctx.cache.forget(r);
+        ctx.releases.changed(r);
     }
+    added(ctx, rel, n);
+    removed
+}
+
+/// Record a new file in the budget (evicting past it); the releases index follows both.
+fn added(ctx: &Ctx, rel: &str, n: u64) {
+    ctx.releases.changed(rel);
     for gone in ctx.cache.added(rel, n) {
         eprintln!("evict {gone}");
+        ctx.releases.changed(&gone);
     }
-    removed
+}
+
+/// `/releases.json`, `/releases/latest.json`: read by the site and by scripts on any origin.
+fn index_json(body: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// The release routes (GET and HEAD only); None for any other path.
+fn releases(ctx: &Ctx, path: &str, method: &Method) -> Option<Response> {
+    if !matches!(
+        path,
+        "/releases.json" | "/releases/latest.json" | "/releases" | "/releases/"
+    ) {
+        return None;
+    }
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return Some(text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"));
+    }
+    let idx = ctx.releases.get();
+    Some(match path {
+        "/releases.json" => index_json(idx.json.clone()),
+        "/releases/latest.json" => match idx.list.first() {
+            Some(r) => index_json(r.json().to_string()),
+            None => json(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error": "no releases"}),
+            ),
+        },
+        _ => (
+            [(header::CACHE_CONTROL, "no-cache")],
+            Html(page::releases(&idx.list)),
+        )
+            .into_response(),
+    })
 }
 
 /// `PUT` with `Content-Range`: one part of a chunked upload.
@@ -256,6 +310,9 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
         "/report" => return report(&ctx, req).await,
         _ => {}
     }
+    if let Some(r) = releases(&ctx, &path, req.method()) {
+        return r;
+    }
     let Some(rel) = clean(&path) else {
         return text(StatusCode::BAD_REQUEST, "bad path\n");
     };
@@ -293,6 +350,7 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
         },
         Method::DELETE => {
             cache.forget(&rel);
+            ctx.releases.changed(&rel);
             match fs::remove_file(&file).await {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -373,9 +431,7 @@ async fn get(ctx: &Ctx, file: &Path, rel: &str, req: Request) -> Response {
         Ok(n) => n,
         Err(_) => return text(StatusCode::BAD_GATEWAY, "upstream fetch failed\n"),
     };
-    for gone in ctx.cache.added(rel, n) {
-        eprintln!("evict {gone}");
-    }
+    added(ctx, rel, n);
     ctx.cache.hit(n, true);
     serve(rel, file, req).await
 }

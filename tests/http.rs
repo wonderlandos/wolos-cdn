@@ -20,8 +20,20 @@ fn start(name: &str, port: u16) -> Srv {
 }
 
 fn start_with(name: &str, port: u16, env: &[(&str, &str)]) -> Srv {
+    start_in(name, port, env, |_| {})
+}
+
+/// `setup` fills the bucket directory before the server starts.
+fn start_in(
+    name: &str,
+    port: u16,
+    env: &[(&str, &str)],
+    setup: impl FnOnce(&std::path::Path),
+) -> Srv {
     let dir = std::env::temp_dir().join(format!("wolos-cdn-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bucket")).unwrap();
+    setup(&dir.join("bucket"));
     let child = Command::new(env!("CARGO_BIN_EXE_wolos-cdn"))
         .env("PORT", port.to_string())
         .env("DATA_DIR", dir.join("bucket"))
@@ -621,4 +633,295 @@ fn cdn_put_client_uploads_in_parts() {
         .unwrap();
     assert!(!out.status.success());
     assert!(!s.dir.join("bucket/iso/no.iso").exists());
+}
+
+const GH: &str = "https://github.com/wonderlandos/wolos-packages/releases/download";
+
+/// A release folder as the publisher leaves it: the ISO (if any) with its `.iso.sha256`, and
+/// release.json naming the GitHub asset.
+fn release(
+    bucket: &std::path::Path,
+    v: &str,
+    iso: &str,
+    data: Option<&[u8]>,
+    extra: serde_json::Value,
+) {
+    let d = bucket.join(format!("v{v}"));
+    std::fs::create_dir_all(&d).unwrap();
+    let mut rj = serde_json::json!({"version": v, "image": format!("{GH}/v{v}/{iso}")});
+    if let Some(data) = data {
+        std::fs::write(d.join(iso), data).unwrap();
+        let line = format!("{}  {iso}\n", sha256::hex(data));
+        std::fs::write(d.join(format!("{iso}.sha256")), line).unwrap();
+        rj["sha256"] = serde_json::json!(sha256::hex(data));
+        rj["size"] = serde_json::json!(data.len());
+    }
+    for (k, val) in extra.as_object().unwrap() {
+        rj[k] = val.clone();
+    }
+    std::fs::write(
+        d.join("release.json"),
+        serde_json::to_vec_pretty(&rj).unwrap(),
+    )
+    .unwrap();
+}
+
+fn get_json(url: &str) -> serde_json::Value {
+    serde_json::from_str(&ureq::get(url).call().unwrap().into_string().unwrap()).unwrap()
+}
+
+fn get_text(url: &str) -> String {
+    ureq::get(url).call().unwrap().into_string().unwrap()
+}
+
+/// Two releases (0.9.1 sorts below 0.12.0 by semver, above it by name), a folder still being
+/// published (ISO without checksum) and folders that are not releases: the index lists the two,
+/// newest first, with the date from release.json or else the ISO's file time.
+#[test]
+fn releases_index_newest_first() {
+    let s = start_in("rel-index", 18470, &[], |b| {
+        release(
+            b,
+            "0.9.1",
+            "wolos-2026.10.20-x86_64.iso",
+            Some(b"old-iso"),
+            serde_json::json!({}),
+        );
+        let iso = b.join("v0.9.1/wolos-2026.10.20-x86_64.iso");
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_792_497_600); // 2026-10-20 12:00 UTC
+        std::fs::File::options()
+            .write(true)
+            .open(iso)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        release(
+            b,
+            "0.12.0",
+            "wolos-2026.11.03-x86_64.iso",
+            Some(b"new-iso-bytes"),
+            serde_json::json!({"date": "2026-11-03", "notes_url": "https://wolos.example/blog/wolos-0-12-0"}),
+        );
+        // Being published: the ISO is there, its checksum not yet.
+        release(
+            b,
+            "0.13.0",
+            "wolos-next.iso",
+            Some(b"next"),
+            serde_json::json!({}),
+        );
+        std::fs::remove_file(b.join("v0.13.0/wolos-next.iso.sha256")).unwrap();
+        // Not release folders.
+        for d in ["vnext", "iso", "0.14.0"] {
+            std::fs::create_dir_all(b.join(d)).unwrap();
+            std::fs::write(b.join(d).join("x.iso"), "x").unwrap();
+            std::fs::write(b.join(d).join("release.json"), "{}").unwrap();
+        }
+    });
+    let r = ureq::get(&format!("{}/releases.json", s.base))
+        .call()
+        .unwrap();
+    assert_eq!(r.header("content-type"), Some("application/json"));
+    assert_eq!(r.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(r.header("cache-control"), Some("no-cache"));
+    let v: serde_json::Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
+    let new = serde_json::json!({
+        "version": "0.12.0", "date": "2026-11-03", "iso": "wolos-2026.11.03-x86_64.iso",
+        "size": 13, "sha256": sha256::hex(b"new-iso-bytes"), "release_json": "/v0.12.0/release.json",
+        "notes_url": "https://wolos.example/blog/wolos-0-12-0",
+        "mirror": format!("{GH}/v0.12.0/wolos-2026.11.03-x86_64.iso"),
+    });
+    let old = serde_json::json!({
+        "version": "0.9.1", "date": "2026-10-20", "iso": "wolos-2026.10.20-x86_64.iso",
+        "size": 7, "sha256": sha256::hex(b"old-iso"), "release_json": "/v0.9.1/release.json",
+        "notes_url": null, "mirror": format!("{GH}/v0.9.1/wolos-2026.10.20-x86_64.iso"),
+    });
+    assert_eq!(v, serde_json::json!({"releases": [new, old]}));
+    // latest.json is the newest entry; the files it names are served.
+    assert_eq!(get_json(&format!("{}/releases/latest.json", s.base)), new);
+    assert_eq!(
+        get_text(&format!("{}/v0.12.0/wolos-2026.11.03-x86_64.iso", s.base)),
+        "new-iso-bytes"
+    );
+    assert_eq!(
+        get_json(&format!("{}/v0.12.0/release.json", s.base))["version"],
+        "0.12.0"
+    );
+    assert_eq!(
+        code(ureq::post(&format!("{}/releases.json", s.base)).send_string("")),
+        405
+    );
+}
+
+/// The page: plain HTML (no scripts), links, sizes, sha256 with a verify line, the USB paragraph;
+/// the status page links to it.
+#[test]
+fn releases_page_renders() {
+    let s = start_in("rel-page", 18471, &[], |b| {
+        release(
+            b,
+            "0.11.4",
+            "wolos-2026.11.01-x86_64.iso",
+            Some(b"a"),
+            serde_json::json!({"date": "2026-11-01"}),
+        );
+        release(
+            b,
+            "0.12.0",
+            "wolos-2026.11.03-x86_64.iso",
+            Some(b"bb"),
+            serde_json::json!({"notes_url": "javascript:alert(1)"}),
+        );
+    });
+    let r = ureq::get(&format!("{}/releases", s.base)).call().unwrap();
+    assert!(r.header("content-type").unwrap().starts_with("text/html"));
+    let page = r.into_string().unwrap();
+    let sha = sha256::hex(b"bb");
+    for want in [
+        "<title>WolOS releases</title>",
+        "WolOS 0.12.0 <span class=t>Latest</span>",
+        "WolOS 0.11.4 <span class=k>2026-11-01</span>",
+        "href=\"/v0.12.0/wolos-2026.11.03-x86_64.iso\"",
+        "href=\"/v0.12.0/wolos-2026.11.03-x86_64.iso.sha256\"",
+        "href=\"/v0.12.0/release.json\"",
+        "2.0 B",
+        &format!("echo \"{sha}  wolos-2026.11.03-x86_64.iso\" | sha256sum -c"),
+        "Write the USB stick",
+        "sudo dd if=wolos-*.iso of=/dev/sdX",
+        "--acc:#0a84ff",
+    ] {
+        assert!(page.contains(want), "{want} not in\n{page}");
+    }
+    assert!(page.find("WolOS 0.12.0").unwrap() < page.find("WolOS 0.11.4").unwrap());
+    assert!(
+        !page.contains("<script") && !page.contains("javascript:"),
+        "{page}"
+    );
+    let status = get_text(&format!("{}/", s.base));
+    assert!(status.contains("<a href=/releases>"), "{status}");
+    assert_eq!(
+        code(ureq::get(&format!("{}/releases/", s.base)).call()),
+        200
+    );
+}
+
+/// KEEP_ISOS=1 (the default): a new release's ISO, uploaded in parts, evicts the older release's
+/// ISO and checksum across the `v*/` folders; the older one stays listed with `iso` null, its
+/// GitHub mirror, and size and sha256 from its release.json. A delete updates the index too.
+#[test]
+fn evicted_iso_is_listed_with_its_mirror() {
+    let old_iso = "wolos-2026.11.01-x86_64.iso";
+    let s = start_in("rel-evict", 18472, &[], |b| {
+        release(
+            b,
+            "0.11.4",
+            old_iso,
+            Some(b"old-iso"),
+            serde_json::json!({}),
+        );
+    });
+    let index = || get_json(&format!("{}/releases.json", s.base))["releases"].clone();
+    assert_eq!(
+        index()[0]["iso"],
+        old_iso,
+        "built and cached before the upload"
+    );
+    let data = noise(20, 7);
+    let url = format!("{}/v0.12.0/wolos-new.iso", s.base);
+    assert_eq!(part(&url, 0, 9, 20, &data[..10]).0, 202);
+    assert_eq!(part(&url, 10, 19, 20, &data[10..]).0, 202);
+    let (c, v) = finish(&url, &sha256::hex(&data));
+    assert_eq!(c, 201, "{v}");
+    let mut removed: Vec<String> = serde_json::from_value(v["removed"].clone()).unwrap();
+    removed.sort();
+    assert_eq!(
+        removed,
+        [
+            format!("v0.11.4/{old_iso}"),
+            format!("v0.11.4/{old_iso}.sha256")
+        ]
+    );
+    assert!(s.dir.join("bucket/v0.11.4/release.json").exists());
+    // v0.12.0 has no release.json yet: not listed; v0.11.4 now points at the mirror.
+    let evicted = serde_json::json!({
+        "version": "0.11.4", "date": index()[0]["date"], "iso": null, "size": 7,
+        "sha256": sha256::hex(b"old-iso"), "release_json": "/v0.11.4/release.json",
+        "notes_url": null, "mirror": format!("{GH}/v0.11.4/{old_iso}"),
+    });
+    assert_eq!(index(), serde_json::json!([evicted]));
+    assert!(index()[0]["date"].as_str().unwrap().starts_with("20"));
+    // The publisher puts the checksum and release.json up last: now 0.12.0 is the newest.
+    let line = format!("{}  wolos-new.iso\n", sha256::hex(&data));
+    let put = |p: &str, body: &str| {
+        let u = format!("{}/{p}", s.base);
+        assert_eq!(
+            code(ureq::put(&u).set(AUTH.0, AUTH.1).send_string(body)),
+            201
+        );
+    };
+    put("v0.12.0/wolos-new.iso.sha256", &line);
+    put(
+        "v0.12.0/release.json",
+        r#"{"version":"0.12.0","date":"2026-11-03"}"#,
+    );
+    let list = index();
+    assert_eq!(list.as_array().unwrap().len(), 2, "{list}");
+    assert_eq!(
+        (&list[0]["version"], &list[0]["iso"]),
+        (&"0.12.0".into(), &"wolos-new.iso".into())
+    );
+    assert_eq!(list[0]["mirror"], serde_json::Value::Null);
+    assert_eq!(list[1], evicted);
+    assert_eq!(
+        get_json(&format!("{}/releases/latest.json", s.base))["version"],
+        "0.12.0"
+    );
+    let page = get_text(&format!("{}/releases", s.base));
+    assert!(page.contains("No longer kept on this host"), "{page}");
+    assert!(
+        page.contains(&format!("href=\"{GH}/v0.11.4/{old_iso}\"")),
+        "{page}"
+    );
+    assert!(page.contains(&format!("echo \"{}  {old_iso}\"", sha256::hex(b"old-iso"))));
+    // A delete under a release folder drops it from the index.
+    let del = format!("{}/v0.12.0/release.json", s.base);
+    assert_eq!(code(ureq::delete(&del).set(AUTH.0, AUTH.1).call()), 204);
+    assert_eq!(index(), serde_json::json!([evicted]));
+}
+
+/// The index is cached; parts do not change it, the chunked complete that puts the ISO in place does.
+#[test]
+fn index_rebuilds_after_chunked_complete() {
+    let data = noise(30, 9);
+    let sha = sha256::hex(&data);
+    let s = start_in("rel-complete", 18473, &[("KEEP_ISOS", "0")], |b| {
+        let d = b.join("v0.12.1");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("wolos.iso.sha256"), format!("{sha}  wolos.iso\n")).unwrap();
+        std::fs::write(
+            d.join("release.json"),
+            r#"{"version":"0.12.1","date":"2026-11-04"}"#,
+        )
+        .unwrap();
+    });
+    let latest = || get_json(&format!("{}/releases/latest.json", s.base));
+    let before = latest();
+    assert_eq!(
+        (&before["iso"], &before["size"], &before["mirror"]),
+        (
+            &serde_json::Value::Null,
+            &serde_json::Value::Null,
+            &serde_json::Value::Null
+        )
+    );
+    let url = format!("{}/v0.12.1/wolos.iso", s.base);
+    assert_eq!(part(&url, 15, 29, 30, &data[15..]).0, 202);
+    assert_eq!(part(&url, 0, 14, 30, &data[..15]).0, 202);
+    assert_eq!(latest(), before, "parts are not in the bucket");
+    assert_eq!(finish(&url, &sha).0, 201);
+    let after = latest();
+    assert_eq!(after["iso"], "wolos.iso");
+    assert_eq!(after["size"], 30);
+    assert_eq!(after["sha256"], sha);
+    assert_eq!(after["date"], "2026-11-04");
 }

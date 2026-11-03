@@ -8,11 +8,16 @@
 //! from and kept; unset = none), MIRRORS (`name=url,...`: `/name/x` pulls `url/x`), MAX_BYTES
 //! (disk budget, 7 GiB: least recently used packages and ISOs are evicted past it), REPORTS_DIR
 //! (error reports, beside DATA_DIR: POST /report from machines that turned them on), KEEP_ISOS
-//! (1: ISOs kept per directory after an upload, older ones and their siblings go; 0 keeps all).
+//! (1: ISOs kept per directory after an upload, older ones and their siblings go; 0 keeps all;
+//! the top-level `v<semver>/` release folders count as one directory).
+//!
+//! Releases: `GET /releases.json` and `/releases/latest.json` index the `v<semver>/` folders, and
+//! `/releases` is the download page (see `releases`).
 
 mod bucket;
 mod cache;
 mod page;
+mod releases;
 mod report;
 mod sha256;
 mod upload;

@@ -14,8 +14,28 @@ Files over 100 MB (the hosting proxy's cap on one request) go up in parts: see [
 | `ORIGIN` | unset | base URL for pull-through |
 | `MIRRORS` | unset | `name=url,...`: `/name/x` pulls `url/x` |
 | `MAX_BYTES` | 7 GiB | disk budget; least recently used packages and ISOs go first, never the newest ISO (outside `MIRRORS` prefixes) or its `.sha256`/`.sig`; also the largest chunked upload |
-| `KEEP_ISOS` | 1 | after an `*.iso` upload, ISOs kept in its directory, newest first; older ones go with their `.sha256`/`.sig` (`x.iso.sha256` or `x.sha256`); 0 keeps all |
+| `KEEP_ISOS` | 1 | after an `*.iso` upload, ISOs kept in its directory, newest first; older ones go with their `.sha256`/`.sig` (`x.iso.sha256` or `x.sha256`); the top-level `v<semver>/` folders count as one directory (highest versions stay, and the ISO just stored); 0 keeps all |
 | `REPORTS_DIR` | beside `DATA_DIR` | error reports |
+
+## Releases
+
+The primary download channel. A release is a top-level `v<semver>/` folder (`v0.12.0/`) holding the
+ISO, its `x.iso.sha256` (`sha256sum` format) and `release.json`. Upload them in that order,
+`release.json` last: a folder with an ISO but no checksum is left out until it is complete.
+
+| request | answers |
+|---|---|
+| `GET /releases.json` | `{"releases":[{version, date, iso, size, sha256, release_json, notes_url, mirror}]}`, newest version first (semver) |
+| `GET /releases/latest.json` | the first entry (404 when there is none) |
+| `GET /releases` | the download page: links, sizes, sha256 with a verify line, how to write the USB stick (linked from `/`) |
+
+`version` is the folder name without `v`; `iso` the file name in the folder (download
+`/v<version>/<iso>`); `release_json` its path here; `date` and `notes_url` come from release.json
+(`date` falls back to the ISO's file time, `YYYY-MM-DD` UTC); `mirror` is release.json's `image`
+(the GitHub asset). Once `KEEP_ISOS` or the disk budget removed the ISO, the version stays listed
+with `iso` null, `size` and `sha256` from release.json, and `mirror` as the download. The JSON is
+`no-cache` with `Access-Control-Allow-Origin: *`. The index is kept in memory and built again after
+any upload, delete or eviction under a `v*/` folder.
 
 ## Chunked upload
 

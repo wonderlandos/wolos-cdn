@@ -7,6 +7,7 @@
 //! temp file beside the target, checks the length and digest, and renames it into place.
 //! `DELETE /<path>?upload=1` aborts. Sessions older than 24 hours are swept.
 use crate::cache::siblings;
+use crate::releases::{Version, folder_version};
 use crate::sha256::{self, Sha256};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -415,37 +416,60 @@ fn check(m: &Manifest, a: u64, b: u64, total: u64) -> Result<(), Fail> {
 
 /// After `rel` (an ISO) is stored: keep the `keep` newest ISOs in its directory, delete the older
 /// ones with their `.sha256`/`.sig` siblings. `keep` 0 keeps all. Returns the removed paths.
+///
+/// The top-level release folders (`v<semver>/`, one ISO each) count as one directory: the ISOs of
+/// the `keep` highest versions stay, and so does the one just stored (an older hotfix uploaded
+/// after the newest release does not evict it). Their `release.json` stays, so the releases index
+/// still lists the version with its GitHub mirror.
 pub fn keep_latest(root: &Path, rel: &str, keep: usize) -> Vec<String> {
     if keep == 0 || !rel.ends_with(".iso") {
         return Vec::new();
     }
     let (dir_rel, _) = rel.rsplit_once('/').unwrap_or(("", rel));
-    let dir = root.join(dir_rel);
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let join = |n: &str| {
-        if dir_rel.is_empty() {
-            n.to_string()
-        } else {
-            format!("{dir_rel}/{n}")
-        }
-    };
-    let mut isos: Vec<(bool, SystemTime, String)> = rd
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let m = e.metadata().ok()?;
-            (name.ends_with(".iso") && m.is_file()).then(|| {
-                let r = join(&name);
-                (r == rel, m.modified().unwrap_or(UNIX_EPOCH), r)
+    let release = !dir_rel.contains('/') && folder_version(dir_rel).is_some();
+    let dirs: Vec<String> = if release {
+        std::fs::read_dir(root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| folder_version(n).is_some())
+                    .collect()
             })
-        })
-        .collect();
-    // The one just stored first, then newest first (name breaks ties).
-    isos.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(y.2.cmp(&x.2)));
+            .unwrap_or_default()
+    } else {
+        vec![dir_rel.to_string()]
+    };
+    // (version, just stored, written, path): version is None outside the release folders.
+    let mut isos: Vec<(Option<Version>, bool, SystemTime, String)> = Vec::new();
+    for d in &dirs {
+        let Ok(rd) = std::fs::read_dir(root.join(d)) else {
+            continue;
+        };
+        let version = if release { folder_version(d) } else { None };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(m) = e.metadata() else { continue };
+            if name.ends_with(".iso") && m.is_file() {
+                let r = if d.is_empty() {
+                    name
+                } else {
+                    format!("{d}/{name}")
+                };
+                let t = m.modified().unwrap_or(UNIX_EPOCH);
+                isos.push((version.clone(), r == rel, t, r));
+            }
+        }
+    }
+    // Highest version first (release folders), then the one just stored, then newest (name breaks ties).
+    isos.sort_by(|x, y| {
+        y.0.cmp(&x.0)
+            .then(y.1.cmp(&x.1))
+            .then(y.2.cmp(&x.2))
+            .then(y.3.cmp(&x.3))
+    });
     let mut gone = Vec::new();
-    for (_, _, old) in isos.into_iter().skip(keep) {
+    for (_, _, _, old) in isos.into_iter().skip(keep).filter(|i| !i.1) {
         for f in std::iter::once(old.clone()).chain(siblings(&old)) {
             if std::fs::remove_file(root.join(&f)).is_ok() {
                 eprintln!("keep-latest: removed {f} (newer ISO {rel})");
