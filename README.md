@@ -4,6 +4,7 @@ The WolOS package bucket on Square Cloud. `GET /<path>` serves a file; a missing
 `ORIGIN` (GitHub release downloads, `<repo>-<date>/<file>`), kept on disk when it never changes
 (packages, ISOs) and passed through when it does (databases, manifests, signatures).
 `PUT`/`DELETE /<path>` with `Authorization: Bearer $UPLOAD_TOKEN` change files; writes are atomic.
+Files over 100 MB (the hosting proxy's cap on one request) go up in parts: see [Chunked upload](#chunked-upload).
 
 | env | default | |
 |---|---|---|
@@ -12,8 +13,51 @@ The WolOS package bucket on Square Cloud. `GET /<path>` serves a file; a missing
 | `UPLOAD_TOKEN` | unset (read only) | set in the Square Cloud dashboard, never in this repo |
 | `ORIGIN` | unset | base URL for pull-through |
 | `MIRRORS` | unset | `name=url,...`: `/name/x` pulls `url/x` |
-| `MAX_BYTES` | 7 GiB | disk budget; least recently used packages and ISOs go first |
+| `MAX_BYTES` | 7 GiB | disk budget; least recently used packages and ISOs go first, never the newest ISO (outside `MIRRORS` prefixes) or its `.sha256`/`.sig`; also the largest chunked upload |
+| `KEEP_ISOS` | 1 | after an `*.iso` upload, ISOs kept in its directory, newest first; older ones go with their `.sha256`/`.sig` (`x.iso.sha256` or `x.sha256`); 0 keeps all |
 | `REPORTS_DIR` | beside `DATA_DIR` | error reports |
+
+## Chunked upload
+
+All requests carry `Authorization: Bearer $UPLOAD_TOKEN`. A session lives in
+`DATA_DIR/.uploads/<sha256 of path>/` (the parts and a JSON manifest: path, total, received ranges,
+start time) and is never served. Paths follow the usual rules (no `..`, no `.upload*` names).
+
+| request | does | answers |
+|---|---|---|
+| `PUT /<path>` + `Content-Range: bytes a-b/total` | stores bytes a..b (inclusive) of a `total`-byte file; any order; the same range again overwrites it | 202 `{path,total,received,ranges,missing}` |
+| `POST /<path>?complete=1` + `X-Content-Sha256: <hex>` | joins the parts in order, checks length and digest, renames into place; ISOs then follow `KEEP_ISOS` | 201 `{path,size,sha256,removed}` |
+| `DELETE /<path>?upload=1` | drops the session | 200 `{path,aborted}` |
+
+Refusals are JSON `{"error": ...}`: 400 bad `Content-Range`, body length or digest header; 401 token;
+404 no session; 409 range overlaps a different received range, total differs from the session's,
+parts missing (with `missing`), or already completing; 413 part over 100 MiB or total over
+`MAX_BYTES`; 416 range outside the total; 422 joined length or sha256 wrong. A complete that fails
+drops the session (the parts are consumed while joining): start again. Sessions older than 24 h are
+swept (at start, hourly, and when a new one opens). `PUT` without `Content-Range` still writes small
+files in one request.
+
+```sh
+curl -H "Authorization: Bearer $UPLOAD_TOKEN" -H "Content-Range: bytes 0-94371839/2147483648" \
+     -T part0 https://wolos.squareweb.app/iso/wolos-0.12.0-x86_64.iso
+# ... the other parts, then:
+curl -X POST -H "Authorization: Bearer $UPLOAD_TOKEN" -H "X-Content-Sha256: $(sha256sum wolos.iso | cut -c1-64)" \
+     "https://wolos.squareweb.app/iso/wolos-0.12.0-x86_64.iso?complete=1"
+```
+
+The client does all of it: `tools/cdn-put` (POSIX sh, curl) cuts the file into parts of up to
+90 MiB, sends 4 at a time, retries each (no answer, 408, 429, 5xx) with growing pauses, aborts the
+session on failure and completes with the file's sha256. It prints the server's JSON on success.
+
+```sh
+UPLOAD_TOKEN=... tools/cdn-put out/wolos.iso iso/wolos-0.12.0-x86_64.iso [--base https://wolos.squareweb.app]
+```
+
+| env | default | |
+|---|---|---|
+| `CDN_PUT_PART_MIB` | 90 | part size in MiB (1 to 95) |
+| `CDN_PUT_JOBS` | 4 | parts in flight |
+| `CDN_PUT_TRIES` | 5 | tries per request |
 
 ## Error reports
 

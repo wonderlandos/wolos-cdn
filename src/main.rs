@@ -1,17 +1,21 @@
 //! wolos-cdn: the WolOS package bucket. GET serves files (pacman repos, ISOs, release manifests);
 //! PUT and DELETE with the upload token change them. Writes are atomic (temp file + rename), so a
-//! pacman client never sees half a database.
+//! pacman client never sees half a database. Files over the proxy's 100 MB request cap go up in
+//! parts (`Content-Range`), then `POST ?complete=1` joins and verifies them (see `upload`).
 //!
 //! Env: HOST (0.0.0.0) and PORT (80) as the hosting runtime sets them, DATA_DIR (./data),
 //! UPLOAD_TOKEN (required for writes; unset = read only), ORIGIN (base URL missing files are pulled
 //! from and kept; unset = none), MIRRORS (`name=url,...`: `/name/x` pulls `url/x`), MAX_BYTES
 //! (disk budget, 7 GiB: least recently used packages and ISOs are evicted past it), REPORTS_DIR
-//! (error reports, beside DATA_DIR: POST /report from machines that turned them on).
+//! (error reports, beside DATA_DIR: POST /report from machines that turned them on), KEEP_ISOS
+//! (1: ISOs kept per directory after an upload, older ones and their siblings go; 0 keeps all).
 
 mod bucket;
 mod cache;
 mod page;
 mod report;
+mod sha256;
+mod upload;
 
 #[tokio::main]
 async fn main() {
@@ -28,6 +32,7 @@ async fn main() {
             .ok()
             .filter(|v| !v.is_empty())
             .map_or_else(|| dir.parent().unwrap_or(&dir).join("reports"), Into::into),
+        keep_isos: env("KEEP_ISOS", "1").parse().expect("KEEP_ISOS"),
     };
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("listen");
     eprintln!("wolos-cdn: serving {} on {addr}", dir.display());

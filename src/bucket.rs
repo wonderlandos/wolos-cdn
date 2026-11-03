@@ -1,7 +1,9 @@
-//! Request handling: path rules, auth, cache headers, atomic writes, pull-through from mirrors.
+//! Request handling: path rules, auth, cache headers, atomic writes, chunked uploads,
+//! pull-through from mirrors.
 use crate::cache::{Cache, immutable};
 use crate::page;
 use crate::report::{self, Reports};
+use crate::upload::{self, Uploads};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -29,6 +31,8 @@ pub struct Config {
     pub max_bytes: u64,
     /// Where error reports are kept (outside `dir`).
     pub reports: PathBuf,
+    /// ISOs kept per directory after an upload (newest first); 0 keeps all.
+    pub keep_isos: usize,
 }
 
 struct Ctx {
@@ -36,21 +40,35 @@ struct Ctx {
     client: reqwest::Client,
     cache: Cache,
     reports: Reports,
+    uploads: Uploads,
 }
 
 pub fn app(cfg: Config) -> Router {
-    let cache = Cache::open(&cfg.dir, cfg.max_bytes);
+    let cache = Cache::open(&cfg.dir, cfg.max_bytes)
+        .with_mirrors(cfg.mirrors.iter().map(|(p, _)| p.clone()).collect());
     let reports = Reports::open(cfg.reports.clone());
+    let uploads = Uploads::new(&cfg.dir, cfg.max_bytes);
+    uploads.sweep(true);
     let client = reqwest::Client::builder()
         .user_agent("wolos-cdn")
         .build()
         .expect("http client");
-    Router::new().fallback(handle).with_state(Arc::new(Ctx {
+    let ctx = Arc::new(Ctx {
         cfg,
         client,
         cache,
         reports,
-    }))
+        uploads,
+    });
+    let weak = Arc::downgrade(&ctx);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+            let Some(ctx) = weak.upgrade() else { return };
+            ctx.uploads.sweep(false);
+        }
+    });
+    Router::new().fallback(handle).with_state(ctx)
 }
 
 /// `name=url,name=url` (MIRRORS env) as prefix pairs.
@@ -87,7 +105,8 @@ pub fn clean(url: &str) -> Option<String> {
         .split('/')
         .filter(|s| !s.is_empty() && *s != ".")
         .collect();
-    if parts.is_empty() || parts.contains(&"..") {
+    // `.upload*` names are the server's own: temp files and upload sessions.
+    if parts.is_empty() || parts.iter().any(|s| *s == ".." || s.starts_with(".upload")) {
         return None;
     }
     Some(parts.join("/"))
@@ -142,6 +161,83 @@ fn text(code: StatusCode, msg: &str) -> Response {
     (code, msg.to_string()).into_response()
 }
 
+fn json(code: StatusCode, v: serde_json::Value) -> Response {
+    (code, axum::Json(v)).into_response()
+}
+
+fn reply(r: Result<serde_json::Value, upload::Fail>, ok: StatusCode) -> Response {
+    match r {
+        Ok(v) => json(ok, v),
+        Err((code, v)) => json(code, v),
+    }
+}
+
+/// A stored file is in place: ISOs past KEEP_ISOS go, then the disk budget is enforced.
+fn stored(ctx: &Ctx, rel: &str, n: u64) -> Vec<String> {
+    let removed = upload::keep_latest(&ctx.cfg.dir, rel, ctx.cfg.keep_isos);
+    for r in &removed {
+        ctx.cache.forget(r);
+    }
+    for gone in ctx.cache.added(rel, n) {
+        eprintln!("evict {gone}");
+    }
+    removed
+}
+
+/// `PUT` with `Content-Range`: one part of a chunked upload.
+async fn put_part(ctx: &Ctx, rel: &str, req: Request) -> Response {
+    let range = req
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(upload::content_range);
+    let Some(range) = range else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "Content-Range must be `bytes a-b/total`"}),
+        );
+    };
+    let len = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    let body = req.into_body().into_data_stream().map_err(io::Error::other);
+    let r = ctx
+        .uploads
+        .part(rel, range, len, StreamReader::new(body))
+        .await;
+    reply(r, StatusCode::ACCEPTED)
+}
+
+/// `POST ?complete=1`: join the parts, check `X-Content-Sha256`, put the file in place.
+async fn complete(ctx: Arc<Ctx>, rel: String, file: PathBuf, headers: &HeaderMap) -> Response {
+    let want = headers
+        .get("x-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .and_then(upload::digest);
+    let Some(want) = want else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "X-Content-Sha256 must be 64 hex digits"}),
+        );
+    };
+    let m = match ctx.uploads.begin_complete(&rel) {
+        Ok(m) => m,
+        Err((code, v)) => return json(code, v),
+    };
+    // Off the async threads, and run to the end even if the client goes away meanwhile.
+    let job = tokio::task::spawn_blocking(move || {
+        let n = ctx.uploads.assemble(&m, &file, &want)?;
+        let removed = stored(&ctx, &rel, n);
+        eprintln!("upload {rel}: complete, {n} bytes, sha256 {want}");
+        Ok(serde_json::json!({"path": rel, "size": n, "sha256": want, "removed": removed}))
+    });
+    match job.await {
+        Ok(r) => reply(r, StatusCode::CREATED),
+        Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
+    }
+}
+
 async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     eprintln!("{} {path}", req.method());
@@ -164,21 +260,37 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
         return text(StatusCode::BAD_REQUEST, "bad path\n");
     };
     let file = cfg.dir.join(&rel);
+    let query = req.uri().query().unwrap_or("").to_string();
+    let flag = |f: &str| query.split('&').any(|p| p == f);
     match *req.method() {
         Method::GET | Method::HEAD => get(&ctx, &file, &rel, req).await,
-        Method::PUT | Method::DELETE if !authorized(req.headers(), &cfg.token) => {
+        Method::POST if !flag("complete=1") => {
+            text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n")
+        }
+        Method::PUT | Method::DELETE | Method::POST if !authorized(req.headers(), &cfg.token) => {
             text(StatusCode::UNAUTHORIZED, "unauthorized\n")
+        }
+        Method::PUT if req.headers().contains_key(header::CONTENT_RANGE) => {
+            put_part(&ctx, &rel, req).await
         }
         Method::PUT => {
             let body = req.into_body().into_data_stream().map_err(io::Error::other);
             match store(StreamReader::new(body), &file).await {
                 Ok(n) => {
-                    cache.added(&rel, n);
+                    stored(&ctx, &rel, n);
                     StatusCode::CREATED.into_response()
                 }
                 Err(e) => text(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}\n")),
             }
         }
+        Method::POST => complete(ctx.clone(), rel, file, req.headers()).await,
+        Method::DELETE if flag("upload=1") => match ctx.uploads.abort(&rel) {
+            Ok(had) => json(
+                StatusCode::OK,
+                serde_json::json!({"path": rel, "aborted": had}),
+            ),
+            Err((code, v)) => json(code, v),
+        },
         Method::DELETE => {
             cache.forget(&rel);
             match fs::remove_file(&file).await {
@@ -310,7 +422,17 @@ mod tests {
             Some("wolos/x86_64/wolos.db")
         );
         assert_eq!(clean("//a/./b").as_deref(), Some("a/b"));
-        for bad in ["/../x", "/a/../../x", "/%2e%2e/x", "/", "/a/", "/a\\b", ""] {
+        for bad in [
+            "/../x",
+            "/a/../../x",
+            "/%2e%2e/x",
+            "/",
+            "/a/",
+            "/a\\b",
+            "",
+            "/.uploads/x/manifest.json",
+            "/a/.upload-1-2",
+        ] {
             assert_eq!(clean(bad), None, "{bad}");
         }
     }

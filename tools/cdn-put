@@ -1,0 +1,180 @@
+#!/bin/sh
+# cdn-put: upload a file of any size to the WolOS CDN in parts (the hosting proxy caps one
+# request at 100 MB), then have the server join and verify it.
+#
+#   UPLOAD_TOKEN=... cdn-put <file> <remote-path> [--base https://wolos.squareweb.app]
+#
+# Parts are at most CDN_PUT_PART_MIB MiB (90), CDN_PUT_JOBS go up at once (4), and each request is
+# tried CDN_PUT_TRIES times (5) with growing pauses. Needs curl, dd and sha256sum (or shasum, or
+# openssl). The token goes to curl through a private header file, never on the command line.
+set -eu
+
+usage() {
+    echo "usage: UPLOAD_TOKEN=... cdn-put <file> <remote-path> [--base URL]" >&2
+    exit 2
+}
+
+base=https://wolos.squareweb.app
+file='' remote=''
+while [ $# -gt 0 ]; do
+    case $1 in
+    --base) [ $# -ge 2 ] || usage; base=$2; shift 2 ;;
+    --base=*) base=${1#--base=}; shift ;;
+    -h | --help) usage ;;
+    *)
+        if [ -z "$file" ]; then file=$1
+        elif [ -z "$remote" ]; then remote=$1
+        else usage
+        fi
+        shift ;;
+    esac
+done
+if [ -z "$file" ] || [ -z "$remote" ]; then usage; fi
+[ -f "$file" ] || { echo "cdn-put: $file: not a file" >&2; exit 1; }
+[ -n "${UPLOAD_TOKEN:-}" ] || { echo "cdn-put: UPLOAD_TOKEN is not set" >&2; exit 1; }
+
+part_mib=${CDN_PUT_PART_MIB:-90}
+jobs=${CDN_PUT_JOBS:-4}
+tries=${CDN_PUT_TRIES:-5}
+case "$part_mib$jobs$tries" in *[!0-9]*) echo "cdn-put: CDN_PUT_* must be numbers" >&2; exit 2 ;; esac
+if [ "$part_mib" -lt 1 ] || [ "$part_mib" -gt 95 ]; then
+    echo "cdn-put: CDN_PUT_PART_MIB must be 1..95" >&2
+    exit 2
+fi
+[ "$jobs" -ge 1 ] || jobs=1
+[ "$tries" -ge 1 ] || tries=1
+
+url=${base%/}/${remote#/}
+size=$(($(wc -c <"$file")))
+part=$((part_mib * 1048576))
+parts=$(((size + part - 1) / part))
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/cdn-put.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT TERM
+(umask 077 && printf 'Authorization: Bearer %s\n' "$UPLOAD_TOKEN" >"$tmp/auth")
+
+say() { echo "cdn-put: $*" >&2; }
+
+# req <out> <curl args...>: one request; prints the HTTP status (000 when the connection failed).
+req() {
+    out=$1
+    shift
+    curl -sS -o "$out" -w '%{http_code}' -H "@$tmp/auth" --connect-timeout 20 "$@" 2>>"$tmp/curl.log" || true
+}
+
+# Worth another try: no answer, timeouts, rate limits, server errors.
+transient() {
+    case $1 in 000 | 408 | 429 | 5??) return 0 ;; *) return 1 ;; esac
+}
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+    else openssl dgst -sha256 -r "$1" | cut -d' ' -f1
+    fi
+}
+
+# The digest is computed while the parts go up.
+sha256 "$file" >"$tmp/sum" &
+sumjob=$!
+
+if [ "$size" -eq 0 ]; then
+    code=$(req "$tmp/resp" -X PUT --data-binary "" "$url")
+    [ "$code" = 201 ] || { say "PUT $remote: HTTP $code $(cat "$tmp/resp" 2>/dev/null)"; exit 1; }
+    wait "$sumjob" || true
+    say "$remote: 0 bytes"
+    exit 0
+fi
+
+# upload_part <i>: cut part i out of the file and PUT it until it is accepted.
+upload_part() {
+    k=$1
+    a=$((k * part))
+    b=$((a + part - 1))
+    [ "$b" -lt "$size" ] || b=$((size - 1))
+    p="$tmp/part.$k"
+    dd if="$file" of="$p" bs=1048576 skip=$((k * part_mib)) count="$part_mib" 2>/dev/null
+    n=1 pause=2
+    while :; do
+        # -T streams the file with a Content-Length; no 100-continue round trip through the proxy.
+        code=$(req "$tmp/resp.$k" -T "$p" -H "Expect:" -H "Content-Range: bytes $a-$b/$size" \
+            -H "Content-Type: application/octet-stream" "$url")
+        case $code in 2??) break ;; esac
+        if ! transient "$code" || [ "$n" -ge "$tries" ]; then
+            say "part $((k + 1))/$parts ($a-$b): HTTP $code $(cat "$tmp/resp.$k" 2>/dev/null)"
+            rm -f "$p"
+            return 1
+        fi
+        say "part $((k + 1))/$parts: HTTP $code, retry $n in ${pause}s"
+        sleep "$pause"
+        n=$((n + 1)) pause=$((pause * 2))
+    done
+    rm -f "$p"
+    say "part $((k + 1))/$parts: $a-$b ok"
+}
+
+# Worker w takes parts w, w+jobs, w+2*jobs, ...; a failure anywhere stops the others.
+worker() {
+    i=$1
+    while [ "$i" -lt "$parts" ] && [ ! -e "$tmp/failed" ]; do
+        upload_part "$i" || { : >"$tmp/failed"; return 1; }
+        i=$((i + jobs))
+    done
+}
+
+say "$remote: $size bytes in $parts part(s) of up to $part_mib MiB, $jobs at a time"
+pids='' w=0
+while [ "$w" -lt "$jobs" ] && [ "$w" -lt "$parts" ]; do
+    worker "$w" &
+    pids="$pids $!"
+    w=$((w + 1))
+done
+ok=1
+for pid in $pids; do wait "$pid" || ok=0; done
+wait "$sumjob" || { say "sha256 failed"; ok=0; }
+
+if [ "$ok" -ne 1 ]; then
+    req "$tmp/resp" -X DELETE "$url?upload=1" >/dev/null
+    say "upload failed, session aborted"
+    exit 1
+fi
+sum=$(cat "$tmp/sum")
+
+# is_in_place: after an answer was lost, the file is there with the right size.
+is_in_place() {
+    len=$(curl -sSI "$url" 2>/dev/null | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }' | tail -n 1)
+    [ "$len" = "$size" ]
+}
+
+n=1 pause=5 lost=0
+while :; do
+    code=$(req "$tmp/resp" -X POST -H "X-Content-Sha256: $sum" --data-binary "" "$url?complete=1")
+    case $code in
+    201)
+        say "$remote: complete, sha256 $sum"
+        cat "$tmp/resp"
+        echo
+        exit 0 ;;
+    404 | 409)
+        # A complete whose answer was lost: done already (404) or still joining (409).
+        if [ "$lost" -eq 1 ] && is_in_place; then
+            say "$remote: in place with $size bytes (the server's answer was lost; sha256 $sum not re-checked)"
+            exit 0
+        fi
+        if [ "$code" = 404 ] || ! grep -q 'already completing' "$tmp/resp"; then
+            say "complete: HTTP $code $(cat "$tmp/resp")"
+            exit 1
+        fi ;;
+    *)
+        if ! transient "$code"; then
+            say "complete: HTTP $code $(cat "$tmp/resp" 2>/dev/null)"
+            exit 1
+        fi
+        lost=1 ;;
+    esac
+    [ "$n" -lt $((tries * 4)) ] || { say "complete: gave up after $n tries (HTTP $code)"; exit 1; }
+    say "complete: HTTP $code, asking again in ${pause}s"
+    sleep "$pause"
+    n=$((n + 1))
+done
