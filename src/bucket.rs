@@ -173,8 +173,22 @@ pub fn clean(url: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// The set is bounded only by the signed index and the publisher; GC against the index is a later task.
+/// A Hub listing picture, `plugins/pictures/<sha256>.<png|webp>` (hub-pipeline publish.sh): named by
+/// its hash, so it never changes and browsers may keep it. Not [`immutable`] for the disk budget:
+/// it is uploaded here and has no upstream copy, so it is never evicted.
+pub fn hub_picture(rel: &str) -> bool {
+    rel.strip_prefix("plugins/pictures/")
+        .and_then(|f| f.strip_suffix(".png").or_else(|| f.strip_suffix(".webp")))
+        .is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
 pub fn cache_control(rel: &str) -> &'static str {
-    if immutable(rel) {
+    if immutable(rel) || hub_picture(rel) {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -584,6 +598,28 @@ mod tests {
         assert!(cache_control("iso/wolos-2026.11.iso").contains("immutable"));
         assert_eq!(cache_control("wolos/x86_64/wolos.db"), "no-cache");
         assert_eq!(cache_control("release.json"), "no-cache");
+    }
+
+    #[test]
+    fn hub_pictures_cache_forever_and_are_never_evicted() {
+        let pic =
+            "plugins/pictures/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6";
+        for ext in ["png", "webp"] {
+            let rel = format!("{pic}.{ext}");
+            assert_eq!(cache_control(&rel), "public, max-age=31536000, immutable");
+            // Uploaded here only (no upstream copy): the disk budget must never drop one.
+            assert!(!immutable(&rel), "{rel}");
+        }
+        for other in [
+            "plugins/index.json",
+            "plugins/pictures/x.png",
+            "plugins/pictures/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6.gif",
+            "plugins/pictures/95D648D3D175B7DF65AF3F36CAACAACC448897768F22945B5637685A8D5242F6.png",
+            "plugins/pictures/sub/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6.png",
+            "other/pictures/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6.png",
+        ] {
+            assert_eq!(cache_control(other), "no-cache", "{other}");
+        }
     }
 
     #[test]

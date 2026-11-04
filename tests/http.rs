@@ -1187,3 +1187,62 @@ fn pages_work_under_either_name() {
         );
     }
 }
+
+/// Hub listing pictures (hub-pipeline publish.sh, plugins/pictures/<sha256>.<png|webp>): served with
+/// their own type (a page shows them; nosniff stops any guessing) and cached for good, being named
+/// by their hash; with a small disk budget they stay, having no upstream copy.
+#[test]
+fn hub_pictures_have_their_type_and_cache_forever() {
+    let s = start_with("pictures", 18490, &[("MAX_BYTES", "10")]);
+    let auth = ("Authorization", "Bearer secret");
+    let sha = "95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6";
+    for (ext, mime) in [("png", "image/png"), ("webp", "image/webp")] {
+        let url = format!("{}/plugins/pictures/{sha}.{ext}", s.base);
+        assert_eq!(
+            code(
+                ureq::put(&url)
+                    .set(auth.0, auth.1)
+                    .send_string("picture bytes")
+            ),
+            201
+        );
+        let r = ureq::get(&url).call().unwrap();
+        assert_eq!(r.header("content-type"), Some(mime));
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+        assert_eq!(
+            r.header("cache-control"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            r.header("content-disposition"),
+            None,
+            "shown, not downloaded"
+        );
+    }
+    // a package over the budget evicts packages, never the pictures
+    let pkg = format!("{}/wolos/x86_64/a-1-1-x86_64.pkg.tar.zst", s.base);
+    assert_eq!(
+        code(
+            ureq::put(&pkg)
+                .set(auth.0, auth.1)
+                .send_string("0123456789abc")
+        ),
+        201
+    );
+    for ext in ["png", "webp"] {
+        let url = format!("{}/plugins/pictures/{sha}.{ext}", s.base);
+        assert_eq!(
+            ureq::get(&url).call().unwrap().into_string().unwrap(),
+            "picture bytes"
+        );
+    }
+    let index = format!("{}/plugins/index.json", s.base);
+    assert_eq!(
+        code(ureq::put(&index).set(auth.0, auth.1).send_string("{}")),
+        201
+    );
+    assert_eq!(
+        ureq::get(&index).call().unwrap().header("cache-control"),
+        Some("no-cache")
+    );
+}
