@@ -7,11 +7,12 @@ use crate::report::{self, Reports};
 use crate::upload::{self, Uploads};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use futures_util::TryStreamExt;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -72,7 +73,63 @@ pub fn app(cfg: Config) -> Router {
             ctx.uploads.sweep(false);
         }
     });
-    Router::new().fallback(handle).with_state(ctx)
+    Router::new()
+        .fallback(handle)
+        .layer(axum::middleware::map_response(hardened))
+        .with_state(ctx)
+}
+
+/// On every answer (QA-WEB-PRIVACY-5): files are never sniffed into other types, and the pages (which
+/// have no script, form or image) get a policy that allows none; `no-transform` keeps Cloudflare from
+/// rewriting them (its email obfuscation turned `ort@1.x` file names into "[email protected]").
+async fn hardened(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if h.get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+    {
+        h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+        h.insert(
+            "content-security-policy",
+            HeaderValue::from_static(page::CSP),
+        );
+        let cc = h
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("no-cache");
+        if let Ok(v) = HeaderValue::from_str(&format!("{cc}, no-transform")) {
+            h.insert(header::CACHE_CONTROL, v);
+        }
+    }
+    res
+}
+
+/// Who is posting, for the day's limit only (never stored): Cloudflare's header, else the last
+/// `X-Forwarded-For` entry (the one the nearest proxy added), else the connection's own address.
+fn client(req: &Request) -> String {
+    let head = |n: &str| {
+        req.headers()
+            .get(n)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+    };
+    if let Some(ip) = head("cf-connecting-ip").filter(|v| !v.is_empty()) {
+        return ip.to_string();
+    }
+    if let Some(ip) = head("x-forwarded-for")
+        .and_then(|v| v.rsplit(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return ip.to_string();
+    }
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or_else(String::new, |c| c.0.ip().to_string())
 }
 
 /// `name=url,name=url` (MIRRORS env) as prefix pairs.
@@ -136,13 +193,16 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
             .is_some_and(|v| constant_eq(v.as_bytes(), want.as_bytes()))
 }
 
-/// POST: keep an error report (anyone). GET `?days=N`: read them (the token).
+/// POST: keep an error report (anyone, with a limit per address). GET `?days=N`: read them (the token).
 async fn report(ctx: &Ctx, req: Request) -> Response {
     match *req.method() {
-        Method::POST => match axum::body::to_bytes(req.into_body(), report::MAX_BODY).await {
-            Ok(b) => ctx.reports.post(&b).into_response(),
-            Err(_) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        },
+        Method::POST => {
+            let from = client(&req);
+            match axum::body::to_bytes(req.into_body(), report::MAX_BODY).await {
+                Ok(b) => ctx.reports.post(&b, &from).into_response(),
+                Err(_) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+            }
+        }
         Method::GET if authorized(req.headers(), &ctx.cfg.token) => {
             let days = req
                 .uri()
@@ -298,14 +358,39 @@ async fn handle(State(ctx): State<Arc<Ctx>>, req: Request) -> Response {
     let (cfg, cache) = (&ctx.cfg, &ctx.cache);
     match path.as_str() {
         "/healthz" => return text(StatusCode::OK, "ok\n"),
-        "/" => {
+        // The front page is for people downloading: releases and the pacman line, nothing about the
+        // operation (QA-WEB-PRIVACY-10).
+        "/" => return Html(page::home()).into_response(),
+        "/robots.txt" => {
+            return (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                page::ROBOTS,
+            )
+                .into_response();
+        }
+        // The operator's view (storage, hit rate, last files served, report counts): the token only,
+        // never indexed, never reloading by itself.
+        "/status" | "/stats" if !authorized(req.headers(), &cfg.token) => {
+            return text(StatusCode::UNAUTHORIZED, "unauthorized\n");
+        }
+        "/status" => {
             let r = ctx.reports.today();
-            return Html(page::html(cache, &cfg.mirrors, &cfg.origin, &r)).into_response();
+            return (
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (
+                        header::HeaderName::from_static("x-robots-tag"),
+                        "noindex, nofollow",
+                    ),
+                ],
+                Html(page::html(cache, &cfg.mirrors, &cfg.origin, &r)),
+            )
+                .into_response();
         }
         "/stats" => {
             let mut v = page::stats(cache, &cfg.mirrors, &cfg.origin);
             v["reports_today"] = serde_json::json!(ctx.reports.today());
-            return axum::Json(v).into_response();
+            return ([(header::CACHE_CONTROL, "no-store")], axum::Json(v)).into_response();
         }
         "/report" => return report(&ctx, req).await,
         _ => {}

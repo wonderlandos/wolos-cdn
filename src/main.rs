@@ -41,9 +41,13 @@ async fn main() {
     };
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("listen");
     eprintln!("wolos-cdn: serving {} on {addr}", dir.display());
-    axum::serve(listener, bucket::app(cfg))
-        .await
-        .expect("serve");
+    // With the peer address, for the per-address limit on POST /report when no proxy header names one.
+    axum::serve(
+        listener,
+        bucket::app(cfg).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("serve");
 }
 
 fn env(k: &str, default: &str) -> String {

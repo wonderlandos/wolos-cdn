@@ -365,10 +365,10 @@ mod tests {
     fn own_copies_are_not_mirrors() {
         let gh = "https://github.com/wonderlandos/wolos-packages/releases/download/v0.12.0/x.iso";
         assert!(!on_this_host(gh, "v0.12.0"));
-        assert!(on_this_host(
-            "https://wolos.squareweb.app/v0.12.0/x.iso",
-            "v0.12.0"
-        ));
+        // Either name of the server (it knows neither): the path decides.
+        for name in ["https://wolos.squareweb.app", "https://cdn.wolos.org"] {
+            assert!(on_this_host(&format!("{name}/v0.12.0/x.iso"), "v0.12.0"));
+        }
         assert!(on_this_host(
             "http://127.0.0.1:8080/v0.12.0/x.iso?dl=1",
             "v0.12.0"

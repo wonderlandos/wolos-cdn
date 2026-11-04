@@ -205,18 +205,149 @@ fn budget_range_and_page() {
         .unwrap();
     assert_eq!(r.status(), 206);
     assert_eq!(r.into_string().unwrap(), "3456");
-    let page = ureq::get(&format!("{}/", s.base))
+    // The operator's page and /stats need the token (QA-WEB-PRIVACY-10); `/` is the public front page.
+    let page = ureq::get(&format!("{}/status", s.base))
+        .set("Authorization", "Bearer secret")
         .call()
         .unwrap()
         .into_string()
         .unwrap();
     assert!(page.contains("WolOS CDN") && page.contains("r/b.pkg.tar.zst"));
     let stats = ureq::get(&format!("{}/stats", s.base))
+        .set("Authorization", "Bearer secret")
         .call()
         .unwrap()
         .into_string()
         .unwrap();
     assert!(stats.contains("\"max\":10"), "{stats}");
+}
+
+/// QA-WEB-PRIVACY-10: the public pages say nothing about the operation; the dashboard, `/stats` and the
+/// report counts are for the token; robots.txt keeps crawlers off them; nothing reloads by itself.
+#[test]
+fn dashboard_requires_token() {
+    let s = start("dashboard", 18476);
+    let auth = ("Authorization", "Bearer secret");
+    let url = |p: &str| format!("{}{p}", s.base);
+    assert_eq!(
+        code(
+            ureq::put(&url("/r/ort@1.x.pkg.tar.zst"))
+                .set(auth.0, auth.1)
+                .send_string("123456")
+        ),
+        201
+    );
+    assert_eq!(
+        code(
+            ureq::post(&url("/report"))
+                .send_string(r#"{"kind":"unit-failed","detail":"a.service"}"#)
+        ),
+        204
+    );
+    // Public: the front page and the releases page.
+    for path in ["/", "/releases"] {
+        let r = ureq::get(&url(path)).call().unwrap();
+        assert_eq!(
+            r.header("x-content-type-options"),
+            Some("nosniff"),
+            "{path}"
+        );
+        assert!(
+            r.header("content-security-policy")
+                .is_some_and(|c| c.contains("default-src 'none'")),
+            "{path}"
+        );
+        assert!(
+            r.header("cache-control")
+                .is_some_and(|c| c.contains("no-transform")),
+            "{path}"
+        );
+        let page = r.into_string().unwrap();
+        for leak in [
+            "Recently used",
+            "Storage",
+            "unit-failed",
+            "a.service",
+            "ort@1.x",
+            "refresh",
+            "Cache hit rate",
+            "Errors today",
+        ] {
+            assert!(!page.contains(leak), "{path} shows {leak:?}");
+        }
+    }
+    assert!(get_text(&url("/")).contains("/releases"));
+    // The operator's routes: the token only.
+    for path in ["/status", "/stats"] {
+        assert_eq!(
+            code(ureq::get(&url(path)).call()),
+            401,
+            "{path} without the token"
+        );
+        assert_eq!(
+            code(ureq::get(&url(path)).set(auth.0, "Bearer wrong").call()),
+            401,
+            "{path} with a wrong token"
+        );
+    }
+    let r = ureq::get(&url("/status"))
+        .set(auth.0, auth.1)
+        .call()
+        .unwrap();
+    assert_eq!(r.header("x-robots-tag"), Some("noindex, nofollow"));
+    assert_eq!(
+        r.header("cache-control").map(|c| c.contains("no-store")),
+        Some(true)
+    );
+    let page = r.into_string().unwrap();
+    assert!(page.contains("Recently used") && page.contains("unit-failed"));
+    assert!(!page.contains("refresh"), "the page does not reload itself");
+    let stats: serde_json::Value = serde_json::from_str(
+        &ureq::get(&url("/stats"))
+            .set(auth.0, auth.1)
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stats["reports_today"]["unit-failed"], 1);
+    let robots = get_text(&url("/robots.txt"));
+    for p in ["/status", "/stats", "/report"] {
+        assert!(robots.contains(&format!("Disallow: {p}")), "{robots}");
+    }
+}
+
+/// QA-WEB-PRIVACY-6 on the wire: the client's address counts only in memory; the 101st post from one
+/// address is refused while another address still gets through; stored reports have the known keys only.
+#[test]
+fn report_flood_from_one_address_is_refused() {
+    let s = start("flood", 18477);
+    let url = format!("{}/report", s.base);
+    let post = |ip: &str, body: &str| {
+        code(
+            ureq::post(&url)
+                .set("CF-Connecting-IP", ip)
+                .send_string(body),
+        )
+    };
+    let ok = r#"{"kind":"crash","version":"0.12.1","detail":"foot SIGSEGV","payload":"zzz-extra","nested":{"a":1}}"#;
+    for i in 0..100 {
+        assert_eq!(post("203.0.113.9", ok), 204, "post {i}");
+    }
+    assert_eq!(post("203.0.113.9", ok), 429);
+    assert_eq!(post("203.0.113.10", ok), 204);
+    let body = ureq::get(&url)
+        .set("Authorization", "Bearer secret")
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(
+        !body.contains("zzz-extra") && !body.contains("nested"),
+        "unknown keys are not stored"
+    );
+    assert!(!body.contains("203.0.113"), "no address is stored");
 }
 
 /// Error reports: anyone posts a small JSON object (no address kept); only the token reads them.
@@ -260,6 +391,7 @@ fn reports_are_kept_and_read_with_the_token() {
     assert_eq!(code(ureq::get(&format!("{}/reports", s.base)).call()), 404);
     let stats: serde_json::Value = serde_json::from_str(
         &ureq::get(&format!("{}/stats", s.base))
+            .set("Authorization", "Bearer secret")
             .call()
             .unwrap()
             .into_string()
@@ -267,7 +399,8 @@ fn reports_are_kept_and_read_with_the_token() {
     )
     .unwrap();
     assert_eq!(stats["reports_today"]["unit-failed"], 1, "{stats}");
-    let page = ureq::get(&format!("{}/", s.base))
+    let page = ureq::get(&format!("{}/status", s.base))
+        .set("Authorization", "Bearer secret")
         .call()
         .unwrap()
         .into_string()
@@ -980,4 +1113,77 @@ fn mirror_is_the_github_copy_not_this_host() {
     let page = get_text(&format!("{}/releases", s.base));
     assert!(!page.contains(&format!("href=\"{cdn}/")), "{page}");
     assert!(page.contains("release.json names no mirror"), "{page}");
+}
+
+/// The server never learns its public name (it has two: cdn.wolos.org, a CNAME, and
+/// wolos.squareweb.app). Asked under the new one, the pages link only to paths on whichever name
+/// was asked (or to GitHub), never to a host of their own; release.json naming the ISO under the
+/// new name is this host's copy, not a mirror.
+#[test]
+fn pages_work_under_either_name() {
+    let names = ["cdn.wolos.org", "wolos.squareweb.app"];
+    let s = start_in("rel-names", 18475, &[], |b| {
+        // Published after the switch: `image` names cdn.wolos.org, `mirror` the GitHub copy.
+        release(
+            b,
+            "0.12.1",
+            "wolos-2026.11.04-x86_64.iso",
+            Some(b"iso"),
+            serde_json::json!({
+                "image": "https://cdn.wolos.org/v0.12.1/wolos-2026.11.04-x86_64.iso",
+                "mirror": format!("{GH}/v0.12.1/wolos-2026.11.04-x86_64.iso"),
+            }),
+        );
+        // Evicted, release.json from before the switch: only its own copy under the old name.
+        let d = b.join("v0.12.0");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("release.json"),
+            r#"{"version":"0.12.0","image":"https://wolos.squareweb.app/v0.12.0/wolos-a.iso"}"#,
+        )
+        .unwrap();
+    });
+    for host in names {
+        let get = |path: &str| {
+            ureq::get(&format!("{}{path}", s.base))
+                .set("Host", host)
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap()
+        };
+        for path in ["/", "/releases"] {
+            let page = get(path);
+            let links: Vec<&str> = page
+                .split(['"', ' ', '>'])
+                .filter_map(|t| t.strip_prefix("href=").or(t.strip_prefix("src=")))
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert!(!links.is_empty(), "{host}{path}: no links");
+            for l in &links {
+                assert!(
+                    (l.starts_with('/') && !l.starts_with("//")) || l.starts_with(GH),
+                    "{host}{path}: {l} is not a path on this host or the GitHub mirror"
+                );
+            }
+            for n in names {
+                assert!(!page.contains(&format!("//{n}")), "{host}{path} names {n}");
+            }
+        }
+        let list: serde_json::Value = serde_json::from_str(&get("/releases.json")).unwrap();
+        let r = &list["releases"];
+        assert_eq!(r[0]["version"], "0.12.1");
+        assert_eq!(r[0]["iso"], "wolos-2026.11.04-x86_64.iso");
+        assert_eq!(
+            r[0]["mirror"],
+            format!("{GH}/v0.12.1/wolos-2026.11.04-x86_64.iso")
+        );
+        assert_eq!(r[0]["release_json"], "/v0.12.1/release.json");
+        assert_eq!(r[1]["version"], "0.12.0");
+        assert_eq!(
+            r[1]["mirror"],
+            serde_json::Value::Null,
+            "its own old name is not a mirror"
+        );
+    }
 }

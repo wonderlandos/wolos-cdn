@@ -1,5 +1,6 @@
-//! The status page at `/` (storage against the budget, hit rate, mirrors, recently used files)
-//! and the releases page at `/releases`. Plain HTML, no scripts, the same inline tokens.
+//! The front page at `/` (releases and the pacman line), the operator's status page at `/status`
+//! (storage against the budget, hit rate, mirrors, recently used files; the token only) and the
+//! releases page at `/releases`. Plain HTML, no scripts, the same inline tokens.
 use crate::cache::Cache;
 use crate::releases::Release;
 use std::sync::atomic::Ordering;
@@ -14,6 +15,13 @@ pub fn human(b: u64) -> String {
     }
     format!("{v:.1} TB")
 }
+
+/// The policy every page is served with: one inline style, no script, no image, no form, no frame.
+pub const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+/// Crawlers: the front page and the releases may be indexed; the operator's routes and the report
+/// receiver are not.
+pub const ROBOTS: &str = "User-agent: *\nDisallow: /status\nDisallow: /stats\nDisallow: /report\n";
 
 /// Text and attribute values (quoted with `"`).
 fn esc(s: &str) -> String {
@@ -43,7 +51,22 @@ pub fn stats(c: &Cache, mirrors: &[(String, String)], origin: &str) -> serde_jso
     })
 }
 
-/// `reports`: today's error reports by kind.
+/// The front page: where to download WolOS and how to point pacman at this host.
+pub fn home() -> String {
+    format!(
+        r#"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>WolOS downloads</title>
+<style>
+{BASE_CSS}
+</style><main>
+<h1>WolOS downloads</h1><p>Packages and images for WolOS.</p>
+<div class=c><h2>Download WolOS</h2><p><a href=/releases>Every release</a> with its checksum, also as <a href=/releases.json>releases.json</a>.</p></div>
+<div class=c style="margin-top:16px"><h2>Packages</h2><p>pacman: <code>Server = https://&lt;this host&gt;/$repo-&lt;release&gt;</code></p></div>
+</main></html>"#
+    )
+}
+
+/// The operator's status page: `reports` is today's error reports by kind.
 pub fn html(
     c: &Cache,
     mirrors: &[(String, String)],
@@ -92,7 +115,7 @@ pub fn html(
     let total: u64 = reports.values().sum();
     format!(
         r#"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>WolOS CDN</title><meta http-equiv=refresh content=15>
+<title>WolOS CDN status</title><meta name=robots content="noindex,nofollow">
 <style>
 {BASE_CSS}
 .g{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}}

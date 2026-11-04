@@ -6,6 +6,14 @@ The WolOS package bucket on Square Cloud. `GET /<path>` serves a file; a missing
 `PUT`/`DELETE /<path>` with `Authorization: Bearer $UPLOAD_TOKEN` change files; writes are atomic.
 Files over 100 MB (the hosting proxy's cap on one request) go up in parts: see [Chunked upload](#chunked-upload).
 
+One server, two names: `https://cdn.wolos.org` (the project's domain: a CNAME to the app, added as
+its custom domain in Square Cloud) and `https://wolos.squareweb.app` (its Square Cloud name). The
+server never reads the `Host` header: its pages link to paths (`/releases`, `/v0.12.0/...`), the
+index gives `release_json` as a path, and an `image` or `mirror` URL whose path is this release's
+folder counts as its own copy whatever the host (`on_this_host`, src/releases.rs). WolOS and the
+release tooling try `cdn.wolos.org` first and `wolos.squareweb.app` when it does not answer. The
+examples below use the old name, which keeps working.
+
 | env | default | |
 |---|---|---|
 | `PORT` | 80 | listen port |
@@ -81,13 +89,24 @@ UPLOAD_TOKEN=... tools/cdn-put out/wolos.iso iso/wolos-0.12.0-x86_64.iso [--base
 
 ## Error reports
 
-WolOS machines that turn reports on send `POST /report` (a JSON object with `kind`, at most 16 KiB;
-no client address is kept). The status page and `/stats` show today's counts by kind. Read them:
+WolOS machines that turn reports on send `POST /report` (a JSON object with `kind`, at most 16 KiB).
+Only `kind` and the client's own `version`, `kernel` and `detail` (cut to 32, 64 and 200 characters) are
+stored, with the server's `at`; any other key is dropped. The client address is never written down: it
+is counted only as a keyed hash in memory for the day's limit of 100 posts per address (`429` after
+that; the address is Cloudflare's `CF-Connecting-IP`, else the proxy's last `X-Forwarded-For` entry,
+else the connection's), and the count is gone at midnight UTC or on a restart. A kind keeps at most
+5 000 reports a day, and the day at most 20 000, so one sender or one kind cannot silence the rest.
+
+`/` is a public page (releases and the pacman line) and `/releases` the downloads. The operator's views
+need the upload token and are not indexed (`/robots.txt`): `/status` (storage, hit rate, last files
+served, today's counts by kind) and `/stats` (the same as JSON). Read the reports themselves:
 
 ```sh
-curl -H "Authorization: Bearer $UPLOAD_TOKEN" "https://wolos.squareweb.app/report?days=7"
+curl -H "Authorization: Bearer $UPLOAD_TOKEN" "https://cdn.wolos.org/report?days=7"
+curl -H "Authorization: Bearer $UPLOAD_TOKEN" "https://cdn.wolos.org/status"
 ```
 
-Kept 30 days, at most 20 000 a day.
+Kept 30 days. The pages are served with `no-transform`; also switch Cloudflare's Email Address
+Obfuscation and Speculation Rules off for this host, they rewrite file names such as `ort@1.x`.
 
 Deployed on Square Cloud from the `Dockerfile` (settings in the dashboard; set `UPLOAD_TOKEN` there). `cargo test` runs the server end to end.
