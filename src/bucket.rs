@@ -80,8 +80,11 @@ pub fn app(cfg: Config) -> Router {
 }
 
 /// On every answer (QA-WEB-PRIVACY-5): files are never sniffed into other types, and the pages (which
-/// have no script, form or image) get a policy that allows none; `no-transform` keeps Cloudflare from
-/// rewriting them (its email obfuscation turned `ort@1.x` file names into "[email protected]").
+/// have no script, form or image) get a policy that allows none. Every Cache-Control carries
+/// `no-transform`: the files are content-addressed or signed, so a proxy must never change their
+/// bytes (Square Cloud's Cloudflare ran Polish on `plugins/pictures/<sha256>.png` and the Hub build
+/// dropped every icon as a hash mismatch; its email obfuscation turned `ort@1.x` file names into
+/// "[email protected]" on the pages).
 async fn hardened(mut res: Response) -> Response {
     let h = res.headers_mut();
     h.insert(
@@ -97,12 +100,15 @@ async fn hardened(mut res: Response) -> Response {
             "content-security-policy",
             HeaderValue::from_static(page::CSP),
         );
-        let cc = h
-            .get(header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("no-cache");
-        if let Ok(v) = HeaderValue::from_str(&format!("{cc}, no-transform")) {
-            h.insert(header::CACHE_CONTROL, v);
+        if !h.contains_key(header::CACHE_CONTROL) {
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        }
+    }
+    if let Some(cc) = h.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()) {
+        if !cc.split(',').any(|d| d.trim() == "no-transform") {
+            if let Ok(v) = HeaderValue::from_str(&format!("{cc}, no-transform")) {
+                h.insert(header::CACHE_CONTROL, v);
+            }
         }
     }
     res
@@ -187,11 +193,12 @@ pub fn hub_picture(rel: &str) -> bool {
         })
 }
 
+/// `no-transform` on both: the bytes are content-addressed or signed, see [`hardened`].
 pub fn cache_control(rel: &str) -> &'static str {
     if immutable(rel) || hub_picture(rel) {
-        "public, max-age=31536000, immutable"
+        "public, max-age=31536000, immutable, no-transform"
     } else {
-        "no-cache"
+        "no-cache, no-transform"
     }
 }
 
@@ -596,8 +603,8 @@ mod tests {
     fn packages_cache_forever_databases_never() {
         assert!(cache_control("wolos/x86_64/a-1-1-x86_64.pkg.tar.zst").contains("immutable"));
         assert!(cache_control("iso/wolos-2026.11.iso").contains("immutable"));
-        assert_eq!(cache_control("wolos/x86_64/wolos.db"), "no-cache");
-        assert_eq!(cache_control("release.json"), "no-cache");
+        assert_eq!(cache_control("wolos/x86_64/wolos.db"), "no-cache, no-transform");
+        assert_eq!(cache_control("release.json"), "no-cache, no-transform");
     }
 
     #[test]
@@ -606,7 +613,10 @@ mod tests {
             "plugins/pictures/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6";
         for ext in ["png", "webp"] {
             let rel = format!("{pic}.{ext}");
-            assert_eq!(cache_control(&rel), "public, max-age=31536000, immutable");
+            assert_eq!(
+                cache_control(&rel),
+                "public, max-age=31536000, immutable, no-transform"
+            );
             // Uploaded here only (no upstream copy): the disk budget must never drop one.
             assert!(!immutable(&rel), "{rel}");
         }
@@ -618,7 +628,7 @@ mod tests {
             "plugins/pictures/sub/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6.png",
             "other/pictures/95d648d3d175b7df65af3f36caacaacc448897768f22945b5637685a8d5242f6.png",
         ] {
-            assert_eq!(cache_control(other), "no-cache", "{other}");
+            assert_eq!(cache_control(other), "no-cache, no-transform", "{other}");
         }
     }
 

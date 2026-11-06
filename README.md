@@ -106,7 +106,7 @@ curl -H "Authorization: Bearer $UPLOAD_TOKEN" "https://cdn.wolos.org/report?days
 curl -H "Authorization: Bearer $UPLOAD_TOKEN" "https://cdn.wolos.org/status"
 ```
 
-Kept 30 days. The pages are served with `no-transform`; also switch Cloudflare's Email Address
+Kept 30 days. Every answer is served with `no-transform` (the files are content-addressed or signed, and Cloudflare Polish re-encoded the Hub PNGs); also switch Cloudflare's Email Address
 Obfuscation and Speculation Rules off for this host, they rewrite file names such as `ort@1.x`.
 
 Deployed on Square Cloud from the `Dockerfile` (settings in the dashboard; set `UPLOAD_TOKEN` there). `cargo test` runs the server end to end.

@@ -87,7 +87,11 @@ fn upload_serve_delete() {
         201
     );
     let r = ureq::get(&pkg).call().unwrap();
-    assert!(r.header("Cache-Control").unwrap().contains("immutable"));
+    // Content-addressed bytes: cached for a year, never rewritten by a proxy (Cloudflare Polish).
+    assert_eq!(
+        r.header("Cache-Control"),
+        Some("public, max-age=31536000, immutable, no-transform")
+    );
     assert_eq!(r.into_string().unwrap(), "pkg");
     assert_eq!(
         code(
@@ -100,7 +104,7 @@ fn upload_serve_delete() {
     let r = ureq::get(&format!("{}/wolos/x86_64/wolos.db", s.base))
         .call()
         .unwrap();
-    assert_eq!(r.header("Cache-Control"), Some("no-cache"));
+    assert_eq!(r.header("Cache-Control"), Some("no-cache, no-transform"));
     // No listings, no anonymous deletes.
     assert_eq!(code(ureq::get(&format!("{}/wolos/", s.base)).call()), 400);
     assert_eq!(code(ureq::delete(&pkg).call()), 401);
@@ -856,7 +860,7 @@ fn releases_index_newest_first() {
         .unwrap();
     assert_eq!(r.header("content-type"), Some("application/json"));
     assert_eq!(r.header("access-control-allow-origin"), Some("*"));
-    assert_eq!(r.header("cache-control"), Some("no-cache"));
+    assert_eq!(r.header("cache-control"), Some("no-cache, no-transform"));
     let v: serde_json::Value = serde_json::from_str(&r.into_string().unwrap()).unwrap();
     let new = serde_json::json!({
         "version": "0.12.0", "date": "2026-11-03", "iso": "wolos-2026.11.03-x86_64.iso",
@@ -1209,9 +1213,11 @@ fn hub_pictures_have_their_type_and_cache_forever() {
         let r = ureq::get(&url).call().unwrap();
         assert_eq!(r.header("content-type"), Some(mime));
         assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+        // Polish on Square Cloud's Cloudflare re-encoded the PNGs and the Hub build dropped every
+        // icon as a hash mismatch: the picture must reach the browser byte for byte.
         assert_eq!(
             r.header("cache-control"),
-            Some("public, max-age=31536000, immutable")
+            Some("public, max-age=31536000, immutable, no-transform")
         );
         assert_eq!(
             r.header("content-disposition"),
@@ -1243,6 +1249,6 @@ fn hub_pictures_have_their_type_and_cache_forever() {
     );
     assert_eq!(
         ureq::get(&index).call().unwrap().header("cache-control"),
-        Some("no-cache")
+        Some("no-cache, no-transform")
     );
 }
